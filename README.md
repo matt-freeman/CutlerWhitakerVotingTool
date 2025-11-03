@@ -97,6 +97,20 @@ The script uses a four-tier timing system that progressively increases voting fr
 
 The counter resets to 0 when Cutler returns to first place. The script tracks and displays vote statistics when exited, showing how many votes were cast in each category.
 
+### Lead Backoff System
+
+To prevent pushing Cutler's lead too high, the script includes an exponential backoff system:
+
+- **Trigger**: When Cutler's lead over the second-place competitor exceeds a configurable threshold (default: 15%)
+- **Behavior**: Exponential backoff gradually increases voting delay
+  - Backoff multiplier starts at 1.0x (normal timing)
+  - Increases by 1.5x each vote when lead is above threshold
+  - Maximum delay capped at 5 minutes (300 seconds)
+  - Backoff resets to 1.0x when lead drops below threshold
+- **Configurable**: Use `--lead-threshold N` to set custom threshold (e.g., `--lead-threshold 20` for 20%)
+
+Example: If standard interval is 60 seconds and backoff multiplier reaches 2.0x, the delay becomes 120 seconds. If it reaches 5.0x, the delay becomes 300 seconds (5 minutes max).
+
 ### Parallel Processing
 
 When Cutler has been behind for extended periods, the script automatically starts additional voting threads to accelerate voting:
@@ -173,6 +187,10 @@ VOTE STATISTICS:
   - `2`: Main + 1 parallel thread (starts as if Cutler is 20+ rounds behind)
   - `3`: Main + 2 parallel threads (starts as if Cutler is 30+ rounds behind)
   - Useful if you know Cutler is already behind and want to skip waiting for thresholds
+- `--lead-threshold N`: Percentage lead threshold to trigger exponential backoff (default: 15.0)
+  - When Cutler's lead exceeds this percentage, the script uses exponential backoff
+  - Backoff increases delay gradually up to 5 minutes maximum
+  - Useful to prevent pushing Cutler's lead too high
 
 ### Example Usage
 
@@ -184,6 +202,16 @@ python3 vote.py --start-threads 3
 Start with 2 threads and debug mode:
 ```bash
 python3 vote.py --start-threads 2 -debug
+```
+
+Start with 20% lead threshold (instead of default 15%):
+```bash
+python3 vote.py --lead-threshold 20
+```
+
+Combine options:
+```bash
+python3 vote.py --start-threads 2 --lead-threshold 18 -debug
 ```
 
 ## Stopping the Script

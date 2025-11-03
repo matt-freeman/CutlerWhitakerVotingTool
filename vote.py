@@ -43,6 +43,11 @@ accelerated_vote_count = 0  # Votes when Cutler is behind 5-9 rounds
 super_accelerated_vote_count = 0  # Votes when Cutler is behind 10+ rounds
 initial_accelerated_vote_count = 0  # Votes when Cutler is behind 1-4 rounds
 
+# Lead backoff control (to prevent pushing lead too high)
+lead_backoff_multiplier = 1.0  # Exponential backoff multiplier when lead is high
+lead_backoff_lock = threading.Lock()  # Lock for backoff state
+MAX_BACKOFF_DELAY = 300  # Maximum delay: 5 minutes (300 seconds)
+
 def debug_print(*args, **kwargs):
     """
     Print debug messages only if debug mode is enabled.
@@ -1158,6 +1163,39 @@ def is_cutler_ahead(results):
     
     return False
 
+def get_cutler_lead_percentage(results, lead_threshold):
+    """
+    Calculate Cutler's lead percentage over the next closest competitor.
+    
+    Args:
+        results (list): List of tuples containing (athlete_name, percentage) sorted by percentage
+        lead_threshold (float): Minimum lead percentage to trigger backoff
+    
+    Returns:
+        tuple: (lead_percentage, is_above_threshold) where:
+            - lead_percentage: Cutler's percentage lead over second place (or None if not in first)
+            - is_above_threshold: True if lead is >= lead_threshold
+    """
+    if not results or len(results) < 2:
+        return None, False
+    
+    # Check if Cutler is in first place
+    first_place_name = results[0][0].lower()
+    cutler_name = TARGET_ATHLETE.lower()
+    
+    if not (cutler_name in first_place_name or 
+            ('cutler' in first_place_name and 'whitaker' in first_place_name)):
+        return None, False
+    
+    # Cutler is in first place - calculate lead
+    cutler_percentage = results[0][1]
+    second_place_percentage = results[1][1]
+    lead_percentage = cutler_percentage - second_place_percentage
+    
+    is_above_threshold = lead_percentage >= lead_threshold
+    
+    return lead_percentage, is_above_threshold
+
 def signal_handler(sig, frame):
     """
     Handle Ctrl+C (SIGINT) gracefully to allow clean shutdown.
@@ -1268,6 +1306,8 @@ def perform_vote_iteration(thread_id="Main"):
                             initial_accelerated_vote_count += 1
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} is not in first place ({current_behind}/5 rounds behind). Using initial accelerated voting.")
+                
+                # Note: Lead percentage checking and backoff adjustment happens in main() after this function returns
             else:
                 if thread_id == "Main":
                     print("⚠ Could not extract results from page")
@@ -1421,11 +1461,15 @@ def main():
     parser.add_argument('--start-threads', type=int, choices=[1, 2, 3], default=1,
                        help='Number of threads to start with (1=main only, 2=main+1 parallel, 3=main+2 parallel). '
                             'Useful if Cutler is already behind and you want to skip waiting for thresholds.')
+    parser.add_argument('--lead-threshold', type=float, default=15.0,
+                       help='Percentage lead threshold to trigger backoff (default: 15.0). '
+                            'When Cutler is ahead by this percentage or more, exponential backoff is used.')
     args = parser.parse_args()
     
     # Set debug mode based on command-line argument
     debug_mode = args.debug
     start_thread_count = args.start_threads
+    lead_threshold = args.lead_threshold
     
     # Set up signal handler for graceful shutdown on Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
@@ -1443,8 +1487,10 @@ def main():
     # Reset all counters to 0 at start
     global vote_count, consecutive_behind_count, standard_vote_count
     global accelerated_vote_count, super_accelerated_vote_count, initial_accelerated_vote_count
+    global lead_backoff_multiplier
     
     vote_count = 0  # Total number of vote attempts
+    lead_backoff_multiplier = 1.0  # Reset backoff multiplier
     
     # Initialize consecutive_behind_count based on start-threads argument
     # This allows starting with parallel threads already active
@@ -1489,6 +1535,26 @@ def main():
             # Perform vote iteration
             success, results, cutler_ahead = perform_vote_iteration(thread_id="Main")
             
+            # Check lead percentage and adjust backoff if needed
+            lead_percentage = None
+            is_lead_high = False
+            if results and cutler_ahead:
+                lead_percentage, is_lead_high = get_cutler_lead_percentage(results, lead_threshold)
+                
+                # Apply exponential backoff if lead is too high
+                with lead_backoff_lock:
+                    if is_lead_high:
+                        # Increase backoff multiplier exponentially (1.5x each time)
+                        lead_backoff_multiplier = min(lead_backoff_multiplier * 1.5, MAX_BACKOFF_DELAY / 60.0)
+                        print(f"⚠ Cutler's lead ({lead_percentage:.2f}%) exceeds threshold ({lead_threshold}%). "
+                              f"Applying exponential backoff (multiplier: {lead_backoff_multiplier:.2f}x)")
+                    else:
+                        # Reset backoff when lead drops below threshold
+                        if lead_backoff_multiplier > 1.0:
+                            lead_backoff_multiplier = 1.0
+                            print(f"✓ Cutler's lead ({lead_percentage:.2f}%) is below threshold ({lead_threshold}%). "
+                                  f"Resetting backoff to normal timing.")
+            
             # Check if we should start/stop parallel voting thread
             with _counter_lock:
                 current_behind_count = consecutive_behind_count
@@ -1531,29 +1597,43 @@ def main():
                     print(f"\n⏹ Stopping second parallel voting thread - Cutler is catching up (below 30 rounds behind)")
             
             # Determine wait time based on Cutler's position and consecutive behind count
-            # This implements the four-tier adaptive timing system
+            # This implements the four-tier adaptive timing system with exponential backoff for high leads
             if not shutdown_flag:
                 with _counter_lock:
                     current_behind_count = consecutive_behind_count
+                
+                # Get current backoff multiplier
+                with lead_backoff_lock:
+                    current_backoff = lead_backoff_multiplier
                 
                 if results and not cutler_ahead:
                     # Cutler is behind - use faster voting intervals based on how long he's been behind
                     if current_behind_count >= 10:
                         # Been behind for 10+ rounds - use super accelerated speed (3-10 seconds)
-                        wait_time = random.randint(3, 10)
+                        base_wait_time = random.randint(3, 10)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (SUPER ACCELERATED)...")
                     elif current_behind_count >= 5:
                         # Been behind for 5-9 rounds - use accelerated speed (7-16 seconds)
-                        wait_time = random.randint(7, 16)
+                        base_wait_time = random.randint(7, 16)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (ACCELERATED)...")
                     else:
                         # Recently behind (1-4 rounds) - use initial accelerated interval (14-37 seconds)
-                        wait_time = random.randint(14, 37)
+                        base_wait_time = random.randint(14, 37)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} is behind ({current_behind_count}/5 rounds). Waiting {wait_time} seconds before next vote (INITIAL ACCELERATED)...")
                 else:
                     # Cutler is ahead or results unavailable - use standard interval (53-67 seconds)
-                    wait_time = random.randint(53, 67)
-                    print(f"\nWaiting {wait_time} seconds before next vote (STANDARD)...")
+                    base_wait_time = random.randint(53, 67)
+                    
+                    # Apply exponential backoff if lead is high
+                    if is_lead_high and current_backoff > 1.0:
+                        wait_time = min(int(base_wait_time * current_backoff), MAX_BACKOFF_DELAY)
+                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD with BACKOFF: {current_backoff:.2f}x, lead: {lead_percentage:.2f}%)...")
+                    else:
+                        wait_time = base_wait_time
+                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD)...")
                 
                 print("Press Ctrl+C to stop\n")
                 
