@@ -2,6 +2,36 @@
 """
 Tool to submit a vote for Cutler Whitaker on the Sports Illustrated
 High School Athlete of the Week poll.
+
+This module provides automated voting functionality with the following features:
+- Adaptive timing based on voting results (4-tier system)
+- Parallel processing with up to 5 threads when Cutler is behind
+- Centralized status display showing all active voting threads
+- Exponential backoff when Cutler's lead exceeds a threshold
+- Thread-safe counters and vote tracking
+- JSON logging of all vote activity to voting_activity.json
+- Graceful shutdown on Ctrl+C
+- Result extraction and display
+
+Thread Management:
+- Main thread: Runs continuously with adaptive timing
+- Parallel threads: Start automatically when Cutler is behind:
+  * Parallel-1: Starts at 20 rounds behind
+  * Parallel-2: Starts at 30 rounds behind
+  * Parallel-3: Starts at 40 rounds behind
+  * Parallel-4: Starts at 50 rounds behind
+
+Adaptive Timing Tiers:
+- Standard (Cutler ahead): 53-67 seconds
+- Initial Accelerated (1-4 rounds behind): 14-37 seconds
+- Accelerated (5-9 rounds behind): 7-16 seconds
+- Super Accelerated (10+ rounds behind): 3-10 seconds
+
+Dependencies:
+- selenium: Browser automation
+- beautifulsoup4: HTML parsing
+- requests: HTTP requests
+- ChromeDriver: Required for Selenium (must be in PATH)
 """
 
 import requests
@@ -14,6 +44,7 @@ import sys
 import argparse
 import random
 import threading
+import uuid
 
 VOTE_URL = "https://www.si.com/high-school/national/vote-who-should-be-high-school-on-si-national-boys-athlete-of-the-week-11-3-2025"
 TARGET_ATHLETE = "Cutler Whitaker"
@@ -33,7 +64,17 @@ _parallel_voting_thread = None  # Reference to the first parallel voting thread 
 _parallel_voting_active = False  # Flag to control first parallel voting thread lifecycle
 _parallel_voting_thread2 = None  # Reference to the second parallel voting thread (starts at 30 rounds)
 _parallel_voting_active2 = False  # Flag to control second parallel voting thread lifecycle
+_parallel_voting_thread3 = None  # Reference to the third parallel voting thread (starts at 40 rounds)
+_parallel_voting_active3 = False  # Flag to control third parallel voting thread lifecycle
+_parallel_voting_thread4 = None  # Reference to the fourth parallel voting thread (starts at 50 rounds)
+_parallel_voting_active4 = False  # Flag to control fourth parallel voting thread lifecycle
 _parallel_voting_lock = threading.Lock()  # Lock for parallel voting control variables
+
+# Centralized status display for all threads
+_thread_status = {}  # Dictionary: thread_id -> {'status': str, 'vote_num': int, 'spinner': str}
+_status_lock = threading.Lock()  # Lock for thread status updates
+_status_display_thread = None  # Reference to the status display thread
+_status_display_active = False  # Flag to control status display thread
 
 # Global vote counters (thread-safe)
 vote_count = 0  # Total number of vote attempts
@@ -42,6 +83,402 @@ standard_vote_count = 0  # Votes when Cutler is ahead
 accelerated_vote_count = 0  # Votes when Cutler is behind 5-9 rounds
 super_accelerated_vote_count = 0  # Votes when Cutler is behind 10+ rounds
 initial_accelerated_vote_count = 0  # Votes when Cutler is behind 1-4 rounds
+
+# Lead backoff control (to prevent pushing lead too high)
+lead_backoff_multiplier = 1.0  # Exponential backoff multiplier when lead is high
+lead_backoff_lock = threading.Lock()  # Lock for backoff state
+MAX_BACKOFF_DELAY = 300  # Maximum delay: 5 minutes (300 seconds)
+
+# JSON logging file
+JSON_LOG_FILE = 'voting_activity.json'  # File to store vote activity summary
+_json_log_lock = threading.Lock()  # Lock for thread-safe JSON file writes
+_current_session_id = None  # Unique session identifier for this run
+_save_top_results = False  # Whether to save top_5_results in JSON (default: False to keep file size down)
+
+def status_display_manager():
+    """
+    Centralized status display thread that shows all active voting threads.
+    
+    This thread continuously updates a multi-line display showing the status
+    of all threads that are currently processing votes. Uses ANSI escape codes
+    to update specific lines without overwriting other output.
+    """
+    global _status_display_active
+    spinner_chars = ['|', '/', '-', '\\']
+    spinner_idx = 0
+    last_line_count = 0  # Track how many lines we printed last time
+    
+    while _status_display_active:
+        with _status_lock:
+            active_threads = list(_thread_status.keys())
+        
+        if active_threads:
+            # Update spinner for all active threads
+            spinner_char = spinner_chars[spinner_idx % 4]
+            spinner_idx += 1
+            
+            with _status_lock:
+                # Update spinner characters
+                for thread_id in active_threads:
+                    if _thread_status[thread_id]['status'] == 'processing':
+                        _thread_status[thread_id]['spinner'] = spinner_char
+            
+            # Build status lines
+            status_lines = []
+            for thread_id in sorted(active_threads):
+                status_info = _thread_status.get(thread_id, {})
+                status = status_info.get('status', 'idle')
+                vote_num = status_info.get('vote_num', 0)
+                spinner = status_info.get('spinner', '|')
+                
+                if status == 'processing':
+                    status_lines.append(f"[{thread_id}] Processing Vote... {spinner}  (Vote #{vote_num})")
+            
+            # Display all status lines using ANSI escape codes
+            if status_lines:
+                # Move cursor up to overwrite previous status lines
+                if last_line_count > 0:
+                    # Move up by the number of lines we printed last time
+                    for _ in range(last_line_count):
+                        print('\033[A', end='')  # Move up one line
+                    print('\033[J', end='', flush=True)  # Clear from cursor to end
+                
+                # Print all status lines
+                for line in status_lines:
+                    print(line, flush=True)
+                
+                last_line_count = len(status_lines)
+            else:
+                # No active threads - clear previous output if any
+                if last_line_count > 0:
+                    for _ in range(last_line_count):
+                        print('\033[A', end='')
+                    print('\033[J', end='', flush=True)
+                    last_line_count = 0
+        else:
+            # No active threads - clear previous output if any
+            if last_line_count > 0:
+                for _ in range(last_line_count):
+                    print('\033[A', end='')
+                print('\033[J', end='', flush=True)
+                last_line_count = 0
+        
+        time.sleep(0.2)  # Update 5 times per second
+
+def update_thread_status(thread_id, status, vote_num=0):
+    """
+    Update the status of a voting thread for centralized display.
+    
+    Args:
+        thread_id (str): Identifier for the thread
+        status (str): Status string ('processing', 'completed', 'idle')
+        vote_num (int): Vote number being processed (optional)
+    """
+    with _status_lock:
+        if status == 'processing':
+            _thread_status[thread_id] = {
+                'status': 'processing',
+                'vote_num': vote_num,
+                'spinner': '|'
+            }
+        elif status == 'completed':
+            # Remove from active display
+            if thread_id in _thread_status:
+                del _thread_status[thread_id]
+        elif status == 'idle':
+            if thread_id in _thread_status:
+                del _thread_status[thread_id]
+
+def start_status_display():
+    """Start the centralized status display thread."""
+    global _status_display_thread, _status_display_active
+    if not _status_display_active:
+        _status_display_active = True
+        _status_display_thread = threading.Thread(target=status_display_manager, daemon=True)
+        _status_display_thread.start()
+
+def stop_status_display():
+    """Stop the centralized status display thread."""
+    global _status_display_active
+    _status_display_active = False
+    with _status_lock:
+        _thread_status.clear()
+    # Clear the status display area
+    print('\r' + ' ' * 80 + '\r', end='', flush=True)
+
+def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ahead, 
+                     consecutive_behind_count, vote_type, lead_percentage=None, is_backoff_vote=False, 
+                     save_top_results=False):
+    """
+    Log vote details to a JSON file for activity tracking.
+    
+    This function writes vote information to a JSON file that maintains a summary
+    of all voting activity. Each vote is appended to a list in the JSON file,
+    creating a chronological record of all votes cast. The summary statistics are
+    automatically updated with each vote. The file is preserved across restarts,
+    with new sessions appending to existing data.
+    
+    The JSON file structure:
+    {
+        "session_start": "YYYY-MM-DD HH:MM:SS",  # First session start time (preserved)
+        "target_athlete": "Cutler Whitaker",
+        "summary": {
+            "total_votes_submitted": int,
+            "standard_votes": int,
+            "initial_accelerated_votes": int,
+            "accelerated_votes": int,
+            "super_accelerated_votes": int,
+            "exponential_backoff_votes": int
+        },
+        "votes": [
+            {
+                "vote_number": int,  # Session-scoped (resets each session)
+                "session_id": str,    # Unique session identifier
+                "thread_id": str,
+                "timestamp": "YYYY-MM-DD HH:MM:SS",
+                "success": bool,
+                "cutler_ahead": bool,
+                "cutler_position": int (1-based, or null if not found),
+                "cutler_percentage": float (or null),
+                "consecutive_behind_count": int,
+                "vote_type": str,
+                "lead_percentage": float (or null, only if cutler_ahead),
+                "exponential_backoff": bool,
+                "top_5_results": [  # Only included if --save-top-results flag is used
+                    {"athlete": str, "percentage": float},
+                    ...
+                ]
+            },
+            ...
+        ]
+    }
+    
+    Args:
+        vote_num (int): Vote number (sequential)
+        thread_id (str): Thread identifier (e.g., "Main", "Parallel-1")
+        timestamp (str): ISO format timestamp of the vote
+        success (bool): Whether the vote was successfully submitted
+        results (list): List of (athlete_name, percentage) tuples, or None
+        cutler_ahead (bool): Whether Cutler is in first place
+        consecutive_behind_count (int): Current consecutive rounds behind count
+        vote_type (str): Type of vote ("standard", "initial_accelerated", "accelerated", "super_accelerated")
+        lead_percentage (float, optional): Cutler's lead percentage if ahead, None otherwise
+        is_backoff_vote (bool, optional): Whether this vote was cast during exponential backoff
+        save_top_results (bool, optional): Whether to include top_5_results in the vote entry.
+            Defaults to False to keep file size down. Uses global _save_top_results flag.
+            Note: This parameter is kept for compatibility but the global flag is used instead.
+    
+    Returns:
+        None: This function only writes to file
+    
+    Thread Safety:
+        This function is fully thread-safe. It uses _json_log_lock to ensure that
+        the entire read-modify-write operation is atomic. Multiple threads can call
+        this function concurrently without risk of file corruption or data loss.
+        The lock ensures that:
+        1. Only one thread can read the file at a time
+        2. Only one thread can modify and write the file at a time
+        3. The summary statistics are calculated and updated atomically
+    """
+    global JSON_LOG_FILE, _json_log_lock, _current_session_id, _save_top_results
+    
+    # Session ID should already be initialized in main(), but provide fallback
+    if _current_session_id is None:
+        # Fallback: Generate unique session ID (timestamp + random component)
+        _current_session_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    
+    # Determine Cutler's position and percentage
+    cutler_position = None
+    cutler_percentage = None
+    top_5_results = []
+    
+    if results:
+        # Find Cutler's position (1-based index)
+        for idx, (name, percentage) in enumerate(results, 1):
+            name_lower = name.lower()
+            if 'cutler' in name_lower and 'whitaker' in name_lower:
+                cutler_position = idx
+                cutler_percentage = percentage
+                break
+        
+        # Get top 5 results for summary (only if save_top_results is enabled)
+        if _save_top_results:
+            top_5_results = [
+                {"athlete": name, "percentage": round(pct, 2)}
+                for name, pct in results[:5]
+            ]
+    
+    # Build vote entry
+    vote_entry = {
+        "vote_number": vote_num,  # Session-scoped vote number (resets each session)
+        "session_id": _current_session_id,  # Unique session identifier
+        "thread_id": thread_id,
+        "timestamp": timestamp,
+        "success": success,
+        "cutler_ahead": cutler_ahead,
+        "cutler_position": cutler_position,
+        "cutler_percentage": round(cutler_percentage, 2) if cutler_percentage is not None else None,
+        "consecutive_behind_count": consecutive_behind_count,
+        "vote_type": vote_type,
+        "lead_percentage": round(lead_percentage, 2) if lead_percentage is not None else None,
+        "exponential_backoff": is_backoff_vote
+    }
+    
+    # Only include top_5_results if save_top_results is True (to keep file size down)
+    # Use global flag instead of parameter to avoid threading issues
+    if _save_top_results:
+        vote_entry["top_5_results"] = top_5_results
+    
+    # Thread-safe JSON file write
+    # The entire read-modify-write operation is protected by _json_log_lock
+    # This ensures atomicity and prevents corruption when multiple threads write simultaneously
+    with _json_log_lock:
+        try:
+            # Try to read existing file
+            try:
+                with open(JSON_LOG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # IMPORTANT: Preserve original session_start timestamp (don't overwrite)
+                # This ensures the file tracks the first session start time
+                # New sessions will append votes but keep the original session_start
+                
+                # Ensure summary exists (handle old format without summary)
+                if "summary" not in data:
+                    data["summary"] = {
+                        "total_votes_submitted": 0,
+                        "standard_votes": 0,
+                        "initial_accelerated_votes": 0,
+                        "accelerated_votes": 0,
+                        "super_accelerated_votes": 0,
+                        "exponential_backoff_votes": 0
+                    }
+                # Ensure exponential_backoff_votes exists in summary (for old format)
+                if "exponential_backoff_votes" not in data["summary"]:
+                    data["summary"]["exponential_backoff_votes"] = 0
+                
+                # Ensure session_start exists (for old format)
+                if "session_start" not in data:
+                    data["session_start"] = timestamp
+                    data["target_athlete"] = TARGET_ATHLETE
+                
+                # Ensure votes array exists (for old format)
+                if "votes" not in data:
+                    data["votes"] = []
+                
+            except (FileNotFoundError, json.JSONDecodeError):
+                # File doesn't exist or is corrupted - create new structure
+                data = {
+                    "session_start": timestamp,  # First session start time
+                    "target_athlete": TARGET_ATHLETE,
+                    "summary": {
+                        "total_votes_submitted": 0,
+                        "standard_votes": 0,
+                        "initial_accelerated_votes": 0,
+                        "accelerated_votes": 0,
+                        "super_accelerated_votes": 0,
+                        "exponential_backoff_votes": 0
+                    },
+                    "votes": []
+                }
+            
+            # Get existing summary BEFORE appending new vote (for historical totals preservation)
+            existing_summary = data.get("summary", {})
+            
+            # Calculate summary from existing votes BEFORE adding the new vote
+            # This gives us the baseline from votes currently in the file
+            summary_before = {
+                "total_votes_submitted": 0,
+                "standard_votes": 0,
+                "initial_accelerated_votes": 0,
+                "accelerated_votes": 0,
+                "super_accelerated_votes": 0,
+                "exponential_backoff_votes": 0
+            }
+            
+            # Count existing votes by type
+            for vote in data["votes"]:
+                if vote.get("success", False):
+                    summary_before["total_votes_submitted"] += 1
+                
+                vote_type_in_entry = vote.get("vote_type", "standard")
+                if vote_type_in_entry == "standard":
+                    summary_before["standard_votes"] += 1
+                elif vote_type_in_entry == "initial_accelerated":
+                    summary_before["initial_accelerated_votes"] += 1
+                elif vote_type_in_entry == "accelerated":
+                    summary_before["accelerated_votes"] += 1
+                elif vote_type_in_entry == "super_accelerated":
+                    summary_before["super_accelerated_votes"] += 1
+                
+                if vote.get("exponential_backoff", False):
+                    summary_before["exponential_backoff_votes"] += 1
+            
+            # Append new vote entry
+            data["votes"].append(vote_entry)
+            
+            # Calculate increment for this new vote
+            # This is what we need to add to the existing summary
+            increment = {
+                "total_votes_submitted": 0,
+                "standard_votes": 0,
+                "initial_accelerated_votes": 0,
+                "accelerated_votes": 0,
+                "super_accelerated_votes": 0,
+                "exponential_backoff_votes": 0
+            }
+            
+            # Increment based on the new vote being added
+            if vote_entry.get("success", False):
+                increment["total_votes_submitted"] = 1
+            
+            vote_type_in_entry = vote_entry.get("vote_type", "standard")
+            if vote_type_in_entry == "standard":
+                increment["standard_votes"] = 1
+            elif vote_type_in_entry == "initial_accelerated":
+                increment["initial_accelerated_votes"] = 1
+            elif vote_type_in_entry == "accelerated":
+                increment["accelerated_votes"] = 1
+            elif vote_type_in_entry == "super_accelerated":
+                increment["super_accelerated_votes"] = 1
+            
+            if vote_entry.get("exponential_backoff", False):
+                increment["exponential_backoff_votes"] = 1
+            
+            # Calculate the difference between historical totals and current file totals
+            # This represents votes that were manually added as historical data
+            historical_offset = {
+                "total_votes_submitted": max(0, existing_summary.get("total_votes_submitted", 0) - summary_before["total_votes_submitted"]),
+                "standard_votes": max(0, existing_summary.get("standard_votes", 0) - summary_before["standard_votes"]),
+                "initial_accelerated_votes": max(0, existing_summary.get("initial_accelerated_votes", 0) - summary_before["initial_accelerated_votes"]),
+                "accelerated_votes": max(0, existing_summary.get("accelerated_votes", 0) - summary_before["accelerated_votes"]),
+                "super_accelerated_votes": max(0, existing_summary.get("super_accelerated_votes", 0) - summary_before["super_accelerated_votes"]),
+                "exponential_backoff_votes": max(0, existing_summary.get("exponential_backoff_votes", 0) - summary_before["exponential_backoff_votes"])
+            }
+            
+            # Final summary = historical offset + current file totals + new vote increment
+            final_summary = {
+                "total_votes_submitted": historical_offset["total_votes_submitted"] + summary_before["total_votes_submitted"] + increment["total_votes_submitted"],
+                "standard_votes": historical_offset["standard_votes"] + summary_before["standard_votes"] + increment["standard_votes"],
+                "initial_accelerated_votes": historical_offset["initial_accelerated_votes"] + summary_before["initial_accelerated_votes"] + increment["initial_accelerated_votes"],
+                "accelerated_votes": historical_offset["accelerated_votes"] + summary_before["accelerated_votes"] + increment["accelerated_votes"],
+                "super_accelerated_votes": historical_offset["super_accelerated_votes"] + summary_before["super_accelerated_votes"] + increment["super_accelerated_votes"],
+                "exponential_backoff_votes": historical_offset["exponential_backoff_votes"] + summary_before["exponential_backoff_votes"] + increment["exponential_backoff_votes"]
+            }
+            
+            # Update summary in data structure (preserving historical totals and incrementing)
+            data["summary"] = final_summary
+            
+            # Write back to file (atomic write operation)
+            with open(JSON_LOG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        except Exception as e:
+            # Log error but don't crash the voting process
+            # This ensures that voting can continue even if JSON logging fails
+            debug_print(f"⚠ Error writing to JSON log: {e}")
+            import traceback
+            debug_print(traceback.format_exc())
 
 def debug_print(*args, **kwargs):
     """
@@ -1158,6 +1595,39 @@ def is_cutler_ahead(results):
     
     return False
 
+def get_cutler_lead_percentage(results, lead_threshold):
+    """
+    Calculate Cutler's lead percentage over the next closest competitor.
+    
+    Args:
+        results (list): List of tuples containing (athlete_name, percentage) sorted by percentage
+        lead_threshold (float): Minimum lead percentage to trigger backoff
+    
+    Returns:
+        tuple: (lead_percentage, is_above_threshold) where:
+            - lead_percentage: Cutler's percentage lead over second place (or None if not in first)
+            - is_above_threshold: True if lead is >= lead_threshold
+    """
+    if not results or len(results) < 2:
+        return None, False
+    
+    # Check if Cutler is in first place
+    first_place_name = results[0][0].lower()
+    cutler_name = TARGET_ATHLETE.lower()
+    
+    if not (cutler_name in first_place_name or 
+            ('cutler' in first_place_name and 'whitaker' in first_place_name)):
+        return None, False
+    
+    # Cutler is in first place - calculate lead
+    cutler_percentage = results[0][1]
+    second_place_percentage = results[1][1]
+    lead_percentage = cutler_percentage - second_place_percentage
+    
+    is_above_threshold = lead_percentage >= lead_threshold
+    
+    return lead_percentage, is_above_threshold
+
 def signal_handler(sig, frame):
     """
     Handle Ctrl+C (SIGINT) gracefully to allow clean shutdown.
@@ -1204,29 +1674,17 @@ def perform_vote_iteration(thread_id="Main"):
     print(f"[{thread_id}] VOTE ATTEMPT #{current_vote_num} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
-    # Show animated processing indicator in a separate thread
-    import threading as threading_local
-    processing_done = threading_local.Event()
-    
-    def show_processing():
-        """Display animated spinner while voting is in progress."""
-        spinner = ['|', '/', '-', '\\']
-        i = 0
-        while not processing_done.is_set():
-            print(f"\r[{thread_id}] Processing Vote... {spinner[i % 4]}", end="", flush=True)
-            i += 1
-            if processing_done.wait(0.2):
-                break
-        print("\r" + " " * 50 + "\r", end="", flush=True)
-    
-    processing_thread = threading_local.Thread(target=show_processing, daemon=True)
-    processing_thread.start()
+    # Update centralized status display
+    update_thread_status(thread_id, 'processing', current_vote_num)
     
     # Submit vote using Selenium browser automation
     success = submit_vote_selenium()
     
-    processing_done.set()
-    processing_thread.join(timeout=0.5)
+    # Clear status after vote completes
+    update_thread_status(thread_id, 'completed')
+    
+    # Get current timestamp for logging
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     
     if success:
         print(f"[{thread_id}] ✓ Vote #{current_vote_num} submitted successfully!")
@@ -1234,6 +1692,8 @@ def perform_vote_iteration(thread_id="Main"):
         # Try to extract and display results
         results = None
         cutler_ahead = False
+        vote_type = "standard"  # Default vote type
+        lead_percentage = None
         
         try:
             with open('vote_result.html', 'r', encoding='utf-8') as f:
@@ -1251,6 +1711,7 @@ def perform_vote_iteration(thread_id="Main"):
                     if cutler_ahead:
                         consecutive_behind_count = 0
                         standard_vote_count += 1
+                        vote_type = "standard"
                         if thread_id == "Main":
                             print(f"✓ {TARGET_ATHLETE} is in FIRST PLACE! Using standard interval.")
                     else:
@@ -1258,34 +1719,89 @@ def perform_vote_iteration(thread_id="Main"):
                         current_behind = consecutive_behind_count
                         if current_behind >= 10:
                             super_accelerated_vote_count += 1
+                            vote_type = "super_accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using SUPER ACCELERATED voting!")
                         elif current_behind >= 5:
                             accelerated_vote_count += 1
+                            vote_type = "accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using accelerated voting.")
                         else:
                             initial_accelerated_vote_count += 1
+                            vote_type = "initial_accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} is not in first place ({current_behind}/5 rounds behind). Using initial accelerated voting.")
+                
+                # Calculate lead percentage if Cutler is ahead (for logging)
+                if cutler_ahead and results and len(results) >= 2:
+                    cutler_percentage = results[0][1]
+                    second_place_percentage = results[1][1]
+                    lead_percentage = cutler_percentage - second_place_percentage
+                
+                # Note: Lead percentage checking and backoff adjustment happens in main() after this function returns
             else:
                 if thread_id == "Main":
                     print("⚠ Could not extract results from page")
                 with _counter_lock:
                     standard_vote_count += 1
+                    vote_type = "standard"
         except FileNotFoundError:
             if thread_id == "Main":
                 print("⚠ Result file not found, skipping result extraction")
             with _counter_lock:
                 standard_vote_count += 1
+                vote_type = "standard"
         except Exception as e:
             if thread_id == "Main":
                 print(f"⚠ Error extracting results: {e}")
             with _counter_lock:
                 standard_vote_count += 1
+                vote_type = "standard"
     else:
         if thread_id == "Main":
             print(f"⚠ Vote #{current_vote_num} failed")
+        # For failed votes, determine vote type based on current behind count
+        with _counter_lock:
+            current_behind = consecutive_behind_count
+            if current_behind >= 10:
+                vote_type = "super_accelerated"
+            elif current_behind >= 5:
+                vote_type = "accelerated"
+            elif current_behind >= 1:
+                vote_type = "initial_accelerated"
+            else:
+                vote_type = "standard"
+    
+    # Determine if this vote was cast during exponential backoff
+    # Backoff is active when Cutler is ahead, has a lead percentage, and the backoff multiplier is > 1.0
+    # We check the multiplier BEFORE the main loop updates it, so we capture the state when this vote was cast
+    is_backoff_active = False
+    if cutler_ahead and lead_percentage is not None:
+        # Check the current backoff multiplier (thread-safe)
+        # This value reflects the multiplier state BEFORE this vote was cast
+        # (since the main loop updates it after perform_vote_iteration returns)
+        with lead_backoff_lock:
+            current_backoff = lead_backoff_multiplier
+        # If multiplier > 1.0, it means backoff was active when this vote cycle started
+        # This vote was cast during a backoff period
+        is_backoff_active = (current_backoff > 1.0)
+    
+    # Log vote to JSON file (thread-safe)
+    with _counter_lock:
+        current_behind_for_log = consecutive_behind_count
+    log_vote_to_json(
+        vote_num=current_vote_num,
+        thread_id=thread_id,
+        timestamp=timestamp,
+        success=success,
+        results=results,
+        cutler_ahead=cutler_ahead if success else False,
+        consecutive_behind_count=current_behind_for_log,
+        vote_type=vote_type,
+        lead_percentage=lead_percentage,
+        is_backoff_vote=is_backoff_active
+    )
     
     return success, results, cutler_ahead
 
@@ -1303,12 +1819,17 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
         active_flag_ref (str): Reference to the active flag variable name (for dynamic access)
     """
     global shutdown_flag, _parallel_voting_active, _parallel_voting_active2
+    global _parallel_voting_active3, _parallel_voting_active4
     
     # Get the appropriate active flag based on the reference
     if active_flag_ref == "_parallel_voting_active":
         active_flag = _parallel_voting_active
     elif active_flag_ref == "_parallel_voting_active2":
         active_flag = _parallel_voting_active2
+    elif active_flag_ref == "_parallel_voting_active3":
+        active_flag = _parallel_voting_active3
+    elif active_flag_ref == "_parallel_voting_active4":
+        active_flag = _parallel_voting_active4
     else:
         active_flag = _parallel_voting_active
     
@@ -1325,6 +1846,14 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
                 if not _parallel_voting_active2:
                     print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is ahead)")
                     break
+            elif active_flag_ref == "_parallel_voting_active3":
+                if not _parallel_voting_active3:
+                    print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is ahead)")
+                    break
+            elif active_flag_ref == "_parallel_voting_active4":
+                if not _parallel_voting_active4:
+                    print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is ahead)")
+                    break
         
         # Check current behind count
         with _counter_lock:
@@ -1338,6 +1867,10 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
                     _parallel_voting_active = False
                 elif active_flag_ref == "_parallel_voting_active2":
                     _parallel_voting_active2 = False
+                elif active_flag_ref == "_parallel_voting_active3":
+                    _parallel_voting_active3 = False
+                elif active_flag_ref == "_parallel_voting_active4":
+                    _parallel_voting_active4 = False
             break
         
         # Perform vote using Super Accelerated timing (3-10 seconds)
@@ -1350,6 +1883,10 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
                     _parallel_voting_active = False
                 elif active_flag_ref == "_parallel_voting_active2":
                     _parallel_voting_active2 = False
+                elif active_flag_ref == "_parallel_voting_active3":
+                    _parallel_voting_active3 = False
+                elif active_flag_ref == "_parallel_voting_active4":
+                    _parallel_voting_active4 = False
             print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is now ahead!)")
             break
         
@@ -1368,18 +1905,92 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
                     elif active_flag_ref == "_parallel_voting_active2":
                         if not _parallel_voting_active2:
                             break
+                    elif active_flag_ref == "_parallel_voting_active3":
+                        if not _parallel_voting_active3:
+                            break
+                    elif active_flag_ref == "_parallel_voting_active4":
+                        if not _parallel_voting_active4:
+                            break
                 time.sleep(1)
                 waited += 1
     
     print(f"[{thread_name}] 🛑 Parallel voting thread stopped")
 
 def parallel_voting_thread_1():
-    """First parallel voting thread (starts at 20 rounds behind)."""
+    """
+    First parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the first parallel voting
+    thread when Cutler has been behind for 20+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 20 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-1", threshold=20, active_flag_ref="_parallel_voting_active")
 
 def parallel_voting_thread_2():
-    """Second parallel voting thread (starts at 30 rounds behind)."""
+    """
+    Second parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the second parallel voting
+    thread when Cutler has been behind for 30+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 30 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-2", threshold=30, active_flag_ref="_parallel_voting_active2")
+
+def parallel_voting_thread_3():
+    """
+    Third parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the third parallel voting
+    thread when Cutler has been behind for 40+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 40 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
+    parallel_voting_thread(thread_name="Parallel-3", threshold=40, active_flag_ref="_parallel_voting_active3")
+
+def parallel_voting_thread_4():
+    """
+    Fourth parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the fourth parallel voting
+    thread when Cutler has been behind for 50+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 50 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
+    parallel_voting_thread(thread_name="Parallel-4", threshold=50, active_flag_ref="_parallel_voting_active4")
 
 def main():
     """
@@ -1405,27 +2016,42 @@ def main():
     Parallel Processing:
     - When Cutler is behind 20+ rounds, a second voting thread starts
     - When Cutler is behind 30+ rounds, a third voting thread starts
-    - All threads vote using Super Accelerated timing (3-10 seconds)
-    - Parallel threads stop automatically when Cutler gets back in the lead
+    - When Cutler is behind 40+ rounds, a fourth voting thread starts
+    - When Cutler is behind 50+ rounds, a fifth voting thread starts
+    - All parallel threads vote using Super Accelerated timing (3-10 seconds)
+    - Parallel threads stop automatically when Cutler gets back in the lead or below threshold
     
     The script tracks vote counts by type and displays statistics on exit.
     """
     global shutdown_flag, debug_mode
     global _parallel_voting_thread, _parallel_voting_active
     global _parallel_voting_thread2, _parallel_voting_active2
+    global _parallel_voting_thread3, _parallel_voting_active3
+    global _parallel_voting_thread4, _parallel_voting_active4
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Vote for Cutler Whitaker on Sports Illustrated poll')
     parser.add_argument('-debug', '--debug', action='store_true', 
                        help='Enable debug output (verbose logging)')
-    parser.add_argument('--start-threads', type=int, choices=[1, 2, 3], default=1,
-                       help='Number of threads to start with (1=main only, 2=main+1 parallel, 3=main+2 parallel). '
+    parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1,
+                       help='Number of threads to start with (1=main only, 2=main+1 parallel, ..., 5=main+4 parallel). '
                             'Useful if Cutler is already behind and you want to skip waiting for thresholds.')
+    parser.add_argument('--lead-threshold', type=float, default=15.0,
+                       help='Percentage lead threshold to trigger backoff (default: 15.0). '
+                            'When Cutler is ahead by this percentage or more, exponential backoff is used.')
+    parser.add_argument('--save-top-results', action='store_true', default=False,
+                       help='Save top 5 results for each vote in JSON file (default: False). '
+                            'Disable to keep file size smaller on long runs.')
     args = parser.parse_args()
     
     # Set debug mode based on command-line argument
     debug_mode = args.debug
     start_thread_count = args.start_threads
+    lead_threshold = args.lead_threshold
+    
+    # Set global flag for saving top results in JSON
+    global _save_top_results
+    _save_top_results = args.save_top_results
     
     # Set up signal handler for graceful shutdown on Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
@@ -1443,12 +2069,20 @@ def main():
     # Reset all counters to 0 at start
     global vote_count, consecutive_behind_count, standard_vote_count
     global accelerated_vote_count, super_accelerated_vote_count, initial_accelerated_vote_count
+    global lead_backoff_multiplier
     
     vote_count = 0  # Total number of vote attempts
+    lead_backoff_multiplier = 1.0  # Reset backoff multiplier
     
     # Initialize consecutive_behind_count based on start-threads argument
     # This allows starting with parallel threads already active
-    if start_thread_count >= 3:
+    if start_thread_count >= 5:
+        # Start with 5 threads (main + 4 parallel) - need 50+ rounds behind
+        initial_behind_count = 50
+    elif start_thread_count >= 4:
+        # Start with 4 threads (main + 3 parallel) - need 40+ rounds behind
+        initial_behind_count = 40
+    elif start_thread_count >= 3:
         # Start with 3 threads (main + 2 parallel) - need 30+ rounds behind
         initial_behind_count = 30
     elif start_thread_count >= 2:
@@ -1466,6 +2100,18 @@ def main():
     super_accelerated_vote_count = 0  # Votes when Cutler is behind 10+ rounds
     initial_accelerated_vote_count = 0  # Votes when Cutler is behind 1-4 rounds
     
+    # Initialize session ID for JSON logging (unique per application run)
+    # This prevents duplicate vote numbers from being confusing across restarts
+    # Each restart gets a new session_id, but vote_number resets to 1 for each session
+    global _current_session_id
+    if _current_session_id is None:
+        session_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        _current_session_id = f"{session_start_time}_{uuid.uuid4().hex[:8]}"
+        debug_print(f"Session ID: {_current_session_id}")
+    
+    # Start centralized status display
+    start_status_display()
+    
     # If starting with multiple threads, initialize them now
     if start_thread_count >= 2:
         print(f"\n🚀 Starting with {start_thread_count} threads (main + {start_thread_count - 1} parallel)")
@@ -1481,6 +2127,16 @@ def main():
                 _parallel_voting_thread2 = threading.Thread(target=parallel_voting_thread_2, daemon=True)
                 _parallel_voting_thread2.start()
                 print(f"   ✓ Second parallel thread started")
+            if start_thread_count >= 4:
+                _parallel_voting_active3 = True
+                _parallel_voting_thread3 = threading.Thread(target=parallel_voting_thread_3, daemon=True)
+                _parallel_voting_thread3.start()
+                print(f"   ✓ Third parallel thread started")
+            if start_thread_count >= 5:
+                _parallel_voting_active4 = True
+                _parallel_voting_thread4 = threading.Thread(target=parallel_voting_thread_4, daemon=True)
+                _parallel_voting_thread4.start()
+                print(f"   ✓ Fourth parallel thread started")
         print()
     
     try:
@@ -1488,6 +2144,26 @@ def main():
         while not shutdown_flag:
             # Perform vote iteration
             success, results, cutler_ahead = perform_vote_iteration(thread_id="Main")
+            
+            # Check lead percentage and adjust backoff if needed
+            lead_percentage = None
+            is_lead_high = False
+            if results and cutler_ahead:
+                lead_percentage, is_lead_high = get_cutler_lead_percentage(results, lead_threshold)
+                
+                # Apply exponential backoff if lead is too high
+                with lead_backoff_lock:
+                    if is_lead_high:
+                        # Increase backoff multiplier exponentially (1.5x each time)
+                        lead_backoff_multiplier = min(lead_backoff_multiplier * 1.5, MAX_BACKOFF_DELAY / 60.0)
+                        print(f"⚠ Cutler's lead ({lead_percentage:.2f}%) exceeds threshold ({lead_threshold}%). "
+                              f"Applying exponential backoff (multiplier: {lead_backoff_multiplier:.2f}x)")
+                    else:
+                        # Reset backoff when lead drops below threshold
+                        if lead_backoff_multiplier > 1.0:
+                            lead_backoff_multiplier = 1.0
+                            print(f"✓ Cutler's lead ({lead_percentage:.2f}%) is below threshold ({lead_threshold}%). "
+                                  f"Resetting backoff to normal timing.")
             
             # Check if we should start/stop parallel voting thread
             with _counter_lock:
@@ -1500,25 +2176,32 @@ def main():
                     # Start first parallel voting thread when Cutler is behind 20+ rounds
                     _parallel_voting_active = True
                     if _parallel_voting_thread is None or not _parallel_voting_thread.is_alive():
+                        active_thread_count = 1 + sum([
+                            _parallel_voting_active2, _parallel_voting_active3, _parallel_voting_active4
+                        ])
                         print(f"\n🚀 Starting first parallel voting thread! Cutler has been behind for {current_behind_count} rounds.")
-                        if current_behind_count >= 30:
-                            print(f"   Now voting with 3 threads at Super Accelerated speed (3-10 seconds each)")
-                        else:
-                            print(f"   Now voting with 2 threads at Super Accelerated speed (3-10 seconds each)")
+                        print(f"   Now voting with {active_thread_count + 1} threads at Super Accelerated speed (3-10 seconds each)")
                         _parallel_voting_thread = threading.Thread(target=parallel_voting_thread_1, daemon=True)
                         _parallel_voting_thread.start()
                 elif cutler_ahead and _parallel_voting_active:
                     # Stop first parallel voting when Cutler gets back in the lead
                     _parallel_voting_active = False
                     print(f"\n⏹ Stopping first parallel voting thread - {TARGET_ATHLETE} is back in the lead!")
+                elif current_behind_count < 20 and _parallel_voting_active:
+                    # Stop first parallel thread if behind count drops below 20
+                    _parallel_voting_active = False
+                    print(f"\n⏹ Stopping first parallel voting thread - Cutler is catching up (below 20 rounds behind)")
                 
                 # Start/stop second parallel thread (threshold: 30 rounds)
                 if current_behind_count >= 30 and not _parallel_voting_active2:
                     # Start second parallel voting thread when Cutler is behind 30+ rounds
                     _parallel_voting_active2 = True
                     if _parallel_voting_thread2 is None or not _parallel_voting_thread2.is_alive():
+                        active_thread_count = 1 + sum([
+                            _parallel_voting_active, _parallel_voting_active3, _parallel_voting_active4
+                        ])
                         print(f"\n🚀 Starting second parallel voting thread! Cutler has been behind for {current_behind_count} rounds.")
-                        print(f"   Now voting with 3 threads at Super Accelerated speed (3-10 seconds each)")
+                        print(f"   Now voting with {active_thread_count + 1} threads at Super Accelerated speed (3-10 seconds each)")
                         _parallel_voting_thread2 = threading.Thread(target=parallel_voting_thread_2, daemon=True)
                         _parallel_voting_thread2.start()
                 elif cutler_ahead and _parallel_voting_active2:
@@ -1529,31 +2212,87 @@ def main():
                     # Stop second parallel thread if behind count drops below 30
                     _parallel_voting_active2 = False
                     print(f"\n⏹ Stopping second parallel voting thread - Cutler is catching up (below 30 rounds behind)")
+                
+                # Start/stop third parallel thread (threshold: 40 rounds)
+                if current_behind_count >= 40 and not _parallel_voting_active3:
+                    # Start third parallel voting thread when Cutler is behind 40+ rounds
+                    _parallel_voting_active3 = True
+                    if _parallel_voting_thread3 is None or not _parallel_voting_thread3.is_alive():
+                        active_thread_count = 1 + sum([
+                            _parallel_voting_active, _parallel_voting_active2, _parallel_voting_active4
+                        ])
+                        print(f"\n🚀 Starting third parallel voting thread! Cutler has been behind for {current_behind_count} rounds.")
+                        print(f"   Now voting with {active_thread_count + 1} threads at Super Accelerated speed (3-10 seconds each)")
+                        _parallel_voting_thread3 = threading.Thread(target=parallel_voting_thread_3, daemon=True)
+                        _parallel_voting_thread3.start()
+                elif cutler_ahead and _parallel_voting_active3:
+                    # Stop third parallel voting when Cutler gets back in the lead
+                    _parallel_voting_active3 = False
+                    print(f"\n⏹ Stopping third parallel voting thread - {TARGET_ATHLETE} is back in the lead!")
+                elif current_behind_count < 40 and _parallel_voting_active3:
+                    # Stop third parallel thread if behind count drops below 40
+                    _parallel_voting_active3 = False
+                    print(f"\n⏹ Stopping third parallel voting thread - Cutler is catching up (below 40 rounds behind)")
+                
+                # Start/stop fourth parallel thread (threshold: 50 rounds)
+                if current_behind_count >= 50 and not _parallel_voting_active4:
+                    # Start fourth parallel voting thread when Cutler is behind 50+ rounds
+                    _parallel_voting_active4 = True
+                    if _parallel_voting_thread4 is None or not _parallel_voting_thread4.is_alive():
+                        active_thread_count = 1 + sum([
+                            _parallel_voting_active, _parallel_voting_active2, _parallel_voting_active3
+                        ])
+                        print(f"\n🚀 Starting fourth parallel voting thread! Cutler has been behind for {current_behind_count} rounds.")
+                        print(f"   Now voting with {active_thread_count + 1} threads at Super Accelerated speed (3-10 seconds each)")
+                        _parallel_voting_thread4 = threading.Thread(target=parallel_voting_thread_4, daemon=True)
+                        _parallel_voting_thread4.start()
+                elif cutler_ahead and _parallel_voting_active4:
+                    # Stop fourth parallel voting when Cutler gets back in the lead
+                    _parallel_voting_active4 = False
+                    print(f"\n⏹ Stopping fourth parallel voting thread - {TARGET_ATHLETE} is back in the lead!")
+                elif current_behind_count < 50 and _parallel_voting_active4:
+                    # Stop fourth parallel thread if behind count drops below 50
+                    _parallel_voting_active4 = False
+                    print(f"\n⏹ Stopping fourth parallel voting thread - Cutler is catching up (below 50 rounds behind)")
             
             # Determine wait time based on Cutler's position and consecutive behind count
-            # This implements the four-tier adaptive timing system
+            # This implements the four-tier adaptive timing system with exponential backoff for high leads
             if not shutdown_flag:
                 with _counter_lock:
                     current_behind_count = consecutive_behind_count
+                
+                # Get current backoff multiplier
+                with lead_backoff_lock:
+                    current_backoff = lead_backoff_multiplier
                 
                 if results and not cutler_ahead:
                     # Cutler is behind - use faster voting intervals based on how long he's been behind
                     if current_behind_count >= 10:
                         # Been behind for 10+ rounds - use super accelerated speed (3-10 seconds)
-                        wait_time = random.randint(3, 10)
+                        base_wait_time = random.randint(3, 10)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (SUPER ACCELERATED)...")
                     elif current_behind_count >= 5:
                         # Been behind for 5-9 rounds - use accelerated speed (7-16 seconds)
-                        wait_time = random.randint(7, 16)
+                        base_wait_time = random.randint(7, 16)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (ACCELERATED)...")
                     else:
                         # Recently behind (1-4 rounds) - use initial accelerated interval (14-37 seconds)
-                        wait_time = random.randint(14, 37)
+                        base_wait_time = random.randint(14, 37)
+                        wait_time = base_wait_time
                         print(f"\n{TARGET_ATHLETE} is behind ({current_behind_count}/5 rounds). Waiting {wait_time} seconds before next vote (INITIAL ACCELERATED)...")
                 else:
                     # Cutler is ahead or results unavailable - use standard interval (53-67 seconds)
-                    wait_time = random.randint(53, 67)
-                    print(f"\nWaiting {wait_time} seconds before next vote (STANDARD)...")
+                    base_wait_time = random.randint(53, 67)
+                    
+                    # Apply exponential backoff if lead is high
+                    if is_lead_high and current_backoff > 1.0:
+                        wait_time = min(int(base_wait_time * current_backoff), MAX_BACKOFF_DELAY)
+                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD with BACKOFF: {current_backoff:.2f}x, lead: {lead_percentage:.2f}%)...")
+                    else:
+                        wait_time = base_wait_time
+                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD)...")
                 
                 print("Press Ctrl+C to stop\n")
                 
@@ -1571,10 +2310,15 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        # Stop status display
+        stop_status_display()
+        
         # Stop all parallel voting threads if they're running
         with _parallel_voting_lock:
             _parallel_voting_active = False
             _parallel_voting_active2 = False
+            _parallel_voting_active3 = False
+            _parallel_voting_active4 = False
         
         # Wait for parallel threads to finish (with timeout)
         if _parallel_voting_thread and _parallel_voting_thread.is_alive():
@@ -1584,6 +2328,14 @@ def main():
         if _parallel_voting_thread2 and _parallel_voting_thread2.is_alive():
             print("\n⏹ Waiting for second parallel voting thread to stop...")
             _parallel_voting_thread2.join(timeout=5)
+        
+        if _parallel_voting_thread3 and _parallel_voting_thread3.is_alive():
+            print("\n⏹ Waiting for third parallel voting thread to stop...")
+            _parallel_voting_thread3.join(timeout=5)
+        
+        if _parallel_voting_thread4 and _parallel_voting_thread4.is_alive():
+            print("\n⏹ Waiting for fourth parallel voting thread to stop...")
+            _parallel_voting_thread4.join(timeout=5)
         
         # Thread-safe read of all counters for final statistics
         with _counter_lock:

@@ -1,0 +1,174 @@
+{
+  "session_start": "2025-01-15 14:30:00",
+  "target_athlete": "Cutler Whitaker",
+  "summary": {
+    "total_votes_submitted": 4,
+    "standard_votes": 1,
+    "initial_accelerated_votes": 2,
+    "accelerated_votes": 0,
+    "super_accelerated_votes": 2,
+    "exponential_backoff_votes": 1
+  },
+  "votes": [
+    {
+      "vote_number": 1,
+      "session_id": "2025-01-15 14:30:00_a1b2c3d4",
+      "thread_id": "Main",
+      "timestamp": "2025-01-15 14:30:05",
+      "success": true,
+      "cutler_ahead": false,
+      "cutler_position": 2,
+      "cutler_percentage": 23.45,
+      "consecutive_behind_count": 1,
+      "vote_type": "initial_accelerated",
+      "lead_percentage": null,
+      "exponential_backoff": false,
+      "top_5_results": [
+        {
+          "athlete": "Dylan Papushak",
+          "percentage": 24.58
+        },
+        {
+          "athlete": "Cutler Whitaker",
+          "percentage": 23.45
+        },
+        {
+          "athlete": "Marcus Johnson",
+          "percentage": 18.32
+        },
+        {
+          "athlete": "Alex Thompson",
+          "percentage": 15.67
+        },
+        {
+          "athlete": "Jordan Smith",
+          "percentage": 12.89
+        }
+      ]
+    },
+    {
+      "vote_number": 2,
+      "session_id": "2025-01-15 14:30:00_a1b2c3d4",
+      "thread_id": "Main",
+      "timestamp": "2025-01-15 14:30:42",
+      "success": true,
+      "cutler_ahead": false,
+      "cutler_position": 2,
+      "cutler_percentage": 23.67,
+      "consecutive_behind_count": 2,
+      "vote_type": "initial_accelerated",
+      "lead_percentage": null,
+      "exponential_backoff": false,
+      "top_5_results": [
+        {
+          "athlete": "Dylan Papushak",
+          "percentage": 24.45
+        },
+        {
+          "athlete": "Cutler Whitaker",
+          "percentage": 23.67
+        },
+        {
+          "athlete": "Marcus Johnson",
+          "percentage": 18.21
+        },
+        {
+          "athlete": "Alex Thompson",
+          "percentage": 15.54
+        },
+        {
+          "athlete": "Jordan Smith",
+          "percentage": 12.78
+        }
+      ]
+    },
+    {
+      "vote_number": 3,
+      "session_id": "2025-01-15 14:30:00_a1b2c3d4",
+      "thread_id": "Main",
+      "timestamp": "2025-01-15 14:31:18",
+      "success": true,
+      "cutler_ahead": true,
+      "cutler_position": 1,
+      "cutler_percentage": 35.12,
+      "consecutive_behind_count": 0,
+      "vote_type": "standard",
+      "lead_percentage": 18.5,
+      "exponential_backoff": true,
+      "top_5_results": [
+        {
+          "athlete": "Cutler Whitaker",
+          "percentage": 35.12
+        },
+        {
+          "athlete": "Dylan Papushak",
+          "percentage": 16.62
+        },
+        {
+          "athlete": "Marcus Johnson",
+          "percentage": 18.15
+        },
+        {
+          "athlete": "Alex Thompson",
+          "percentage": 15.48
+        },
+        {
+          "athlete": "Jordan Smith",
+          "percentage": 12.71
+        }
+      ]
+    },
+    {
+      "vote_number": 4,
+      "session_id": "2025-01-15 14:30:00_a1b2c3d4",
+      "thread_id": "Parallel-1",
+      "timestamp": "2025-01-15 14:32:05",
+      "success": true,
+      "cutler_ahead": false,
+      "cutler_position": 2,
+      "cutler_percentage": 22.34,
+      "consecutive_behind_count": 25,
+      "vote_type": "super_accelerated",
+      "lead_percentage": null,
+      "exponential_backoff": false,
+      "top_5_results": [
+        {
+          "athlete": "Dylan Papushak",
+          "percentage": 24.78
+        },
+        {
+          "athlete": "Cutler Whitaker",
+          "percentage": 22.34
+        },
+        {
+          "athlete": "Marcus Johnson",
+          "percentage": 18.09
+        },
+        {
+          "athlete": "Alex Thompson",
+          "percentage": 15.42
+        },
+        {
+          "athlete": "Jordan Smith",
+          "percentage": 12.65
+        }
+      ]
+    },
+    {
+      "vote_number": 5,
+      "session_id": "2025-01-15 14:30:00_a1b2c3d4",
+      "thread_id": "Main",
+      "timestamp": "2025-01-15 14:32:12",
+      "success": false,
+      "cutler_ahead": false,
+      "cutler_position": null,
+      "cutler_percentage": null,
+      "consecutive_behind_count": 26,
+      "vote_type": "super_accelerated",
+      "lead_percentage": null,
+      "exponential_backoff": false,
+      "top_5_results": []
+    }
+  ]
+}
+
