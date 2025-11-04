@@ -2,6 +2,35 @@
 """
 Tool to submit a vote for Cutler Whitaker on the Sports Illustrated
 High School Athlete of the Week poll.
+
+This module provides automated voting functionality with the following features:
+- Adaptive timing based on voting results (4-tier system)
+- Parallel processing with up to 5 threads when Cutler is behind
+- Centralized status display showing all active voting threads
+- Exponential backoff when Cutler's lead exceeds a threshold
+- Thread-safe counters and vote tracking
+- Graceful shutdown on Ctrl+C
+- Result extraction and display
+
+Thread Management:
+- Main thread: Runs continuously with adaptive timing
+- Parallel threads: Start automatically when Cutler is behind:
+  * Parallel-1: Starts at 20 rounds behind
+  * Parallel-2: Starts at 30 rounds behind
+  * Parallel-3: Starts at 40 rounds behind
+  * Parallel-4: Starts at 50 rounds behind
+
+Adaptive Timing Tiers:
+- Standard (Cutler ahead): 53-67 seconds
+- Initial Accelerated (1-4 rounds behind): 14-37 seconds
+- Accelerated (5-9 rounds behind): 7-16 seconds
+- Super Accelerated (10+ rounds behind): 3-10 seconds
+
+Dependencies:
+- selenium: Browser automation
+- beautifulsoup4: HTML parsing
+- requests: HTTP requests
+- ChromeDriver: Required for Selenium (must be in PATH)
 """
 
 import requests
@@ -1547,19 +1576,79 @@ def parallel_voting_thread(thread_name="Parallel", threshold=20, active_flag_ref
     print(f"[{thread_name}] 🛑 Parallel voting thread stopped")
 
 def parallel_voting_thread_1():
-    """First parallel voting thread (starts at 20 rounds behind)."""
+    """
+    First parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the first parallel voting
+    thread when Cutler has been behind for 20+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 20 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-1", threshold=20, active_flag_ref="_parallel_voting_active")
 
 def parallel_voting_thread_2():
-    """Second parallel voting thread (starts at 30 rounds behind)."""
+    """
+    Second parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the second parallel voting
+    thread when Cutler has been behind for 30+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 30 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-2", threshold=30, active_flag_ref="_parallel_voting_active2")
 
 def parallel_voting_thread_3():
-    """Third parallel voting thread (starts at 40 rounds behind)."""
+    """
+    Third parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the third parallel voting
+    thread when Cutler has been behind for 40+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 40 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-3", threshold=40, active_flag_ref="_parallel_voting_active3")
 
 def parallel_voting_thread_4():
-    """Fourth parallel voting thread (starts at 50 rounds behind)."""
+    """
+    Fourth parallel voting thread wrapper function.
+    
+    This function is a convenience wrapper that starts the fourth parallel voting
+    thread when Cutler has been behind for 50+ consecutive rounds. The thread
+    votes at Super Accelerated speed (3-10 seconds between votes) to help
+    catch up.
+    
+    The thread automatically stops when:
+    - Cutler gets back in the lead
+    - The behind count drops below 50 rounds
+    - The shutdown flag is set (Ctrl+C)
+    
+    Returns:
+        None: This function starts a thread and returns immediately
+    """
     parallel_voting_thread(thread_name="Parallel-4", threshold=50, active_flag_ref="_parallel_voting_active4")
 
 def main():

@@ -3,10 +3,34 @@
 Thread Performance Benchmarking Tool
 
 This script measures voting performance at different thread counts to identify
-optimal thread count and diminishing returns point.
+optimal thread count and the point where diminishing returns occur.
+
+The benchmark tool:
+- Tests voting performance with 1 to N threads
+- Measures throughput (votes per minute)
+- Tracks resource usage (memory, CPU)
+- Calculates per-thread efficiency
+- Identifies where adding more threads provides <10% improvement
+- Provides recommendations for optimal thread count
+
+Metrics Collected:
+- Votes per minute (overall throughput)
+- Votes per thread per minute (efficiency)
+- Success rate (percentage of successful votes)
+- Average/median vote time
+- Memory usage (average and peak)
+- CPU usage (average and peak)
+- Error count
 
 Usage:
     python3 benchmark_threads.py --threads 1,2,3,4,5 --duration 300
+    
+    --threads: Comma-separated list of thread counts to test
+    --duration: Duration in seconds to run each benchmark (default: 300 = 5 minutes)
+
+Dependencies:
+- psutil: System resource monitoring (optional but recommended)
+- vote: The voting module to benchmark
 """
 
 import argparse
@@ -22,17 +46,27 @@ import statistics
 import vote
 
 # Global metrics collection
+# This dictionary stores aggregate metrics across all benchmark threads.
+# All access is protected by the 'lock' to ensure thread safety.
 metrics = {
-    'votes_submitted': 0,
-    'votes_failed': 0,
-    'vote_times': [],  # Time taken for each vote
-    'memory_usage': [],  # Memory usage over time
-    'cpu_usage': [],  # CPU usage over time
-    'errors': [],  # Error messages
-    'lock': threading.Lock()
+    'votes_submitted': 0,      # Count of successful votes
+    'votes_failed': 0,         # Count of failed votes
+    'vote_times': [],          # List of time taken for each vote (in seconds)
+    'memory_usage': [],        # List of memory usage samples (in MB)
+    'cpu_usage': [],           # List of CPU usage samples (as percentage)
+    'errors': [],              # List of error messages encountered
+    'lock': threading.Lock()   # Thread-safe lock for accessing metrics
 }
 
 # Performance tracking per thread
+# This dictionary tracks individual thread performance statistics.
+# Key: thread_id (int), Value: dict with performance metrics
+# Each thread's stats include:
+#   - votes: Number of successful votes
+#   - failures: Number of failed votes
+#   - total_time: Sum of all vote times for this thread
+#   - min_time: Minimum vote time observed
+#   - max_time: Maximum vote time observed
 thread_stats = defaultdict(lambda: {
     'votes': 0,
     'failures': 0,
@@ -42,7 +76,22 @@ thread_stats = defaultdict(lambda: {
 })
 
 def collect_system_metrics():
-    """Collect system resource usage metrics."""
+    """
+    Collect system resource usage metrics for the current process.
+    
+    This function uses psutil to gather real-time resource usage statistics
+    including memory consumption and CPU utilization. The metrics are stored
+    in the global metrics dictionary for later analysis.
+    
+    Returns:
+        tuple: (memory_mb, cpu_percent) where:
+            - memory_mb (float): Memory usage in megabytes (RSS - Resident Set Size)
+            - cpu_percent (float): CPU usage as a percentage (0-100)
+    
+    Note:
+        This function is thread-safe and appends metrics to global lists
+        protected by a lock.
+    """
     process = psutil.Process()
     memory_mb = process.memory_info().rss / 1024 / 1024  # MB
     cpu_percent = process.cpu_percent(interval=0.1)
@@ -54,7 +103,27 @@ def collect_system_metrics():
     return memory_mb, cpu_percent
 
 def benchmark_voting_thread(thread_id, duration, target_time):
-    """Run voting in a thread and collect metrics."""
+    """
+    Run voting in a thread and collect performance metrics.
+    
+    This function runs a voting loop in a separate thread for the specified
+    duration, collecting metrics on vote success, timing, and failures.
+    All metrics are stored in thread-safe global data structures.
+    
+    Args:
+        thread_id (int): Unique identifier for this benchmark thread
+        duration (float): Duration in seconds to run the benchmark
+        target_time (float): Start time of the benchmark (for synchronization)
+    
+    Returns:
+        None: This function runs in a loop and updates global metrics
+    
+    Note:
+        - Uses Super Accelerated timing (3-10 seconds) between votes
+        - Thread-safe metrics collection using locks
+        - Handles exceptions gracefully and records them in metrics
+        - Stops when duration expires or shutdown_flag is set
+    """
     start_time = time.time()
     thread_stats[thread_id] = {
         'votes': 0,
@@ -102,7 +171,40 @@ def benchmark_voting_thread(thread_id, duration, target_time):
     print(f"[Thread-{thread_id}] Completed benchmark")
 
 def run_benchmark(num_threads, duration_seconds):
-    """Run benchmark with specified number of threads."""
+    """
+    Run a complete benchmark test with the specified number of threads.
+    
+    This function orchestrates a benchmark run by:
+    1. Resetting all metrics and vote module state
+    2. Starting a resource monitoring thread
+    3. Launching N voting threads (where N = num_threads)
+    4. Collecting metrics during the benchmark
+    5. Calculating aggregate statistics
+    6. Returning comprehensive results
+    
+    Args:
+        num_threads (int): Number of voting threads to run concurrently
+        duration_seconds (int): Duration in seconds to run the benchmark
+    
+    Returns:
+        dict: Dictionary containing comprehensive benchmark results with keys:
+            - num_threads (int): Number of threads tested
+            - duration (float): Actual elapsed time
+            - total_votes (int): Total vote attempts
+            - votes_submitted (int): Successful votes
+            - votes_failed (int): Failed votes
+            - success_rate (float): Percentage of successful votes
+            - votes_per_minute (float): Overall throughput
+            - votes_per_thread_per_minute (float): Per-thread efficiency
+            - avg_vote_time (float): Average time per vote in seconds
+            - median_vote_time (float): Median time per vote in seconds
+            - avg_memory_mb (float): Average memory usage in MB
+            - max_memory_mb (float): Peak memory usage in MB
+            - avg_cpu_percent (float): Average CPU usage percentage
+            - max_cpu_percent (float): Peak CPU usage percentage
+            - errors (int): Number of errors encountered
+            - thread_efficiency (list): Per-thread performance breakdown
+    """
     print(f"\n{'='*70}")
     print(f"BENCHMARK: {num_threads} Thread(s) for {duration_seconds} seconds")
     print(f"{'='*70}\n")
@@ -215,7 +317,20 @@ def run_benchmark(num_threads, duration_seconds):
     }
 
 def print_results(results):
-    """Print formatted benchmark results."""
+    """
+    Print formatted benchmark results to stdout.
+    
+    Displays a comprehensive summary of benchmark results including
+    performance metrics, resource usage, and per-thread statistics
+    in a human-readable format.
+    
+    Args:
+        results (dict): Benchmark results dictionary from run_benchmark()
+            Must contain all keys returned by run_benchmark()
+    
+    Returns:
+        None: This function only prints output
+    """
     print(f"\n{'='*70}")
     print(f"RESULTS: {results['num_threads']} Thread(s)")
     print(f"{'='*70}")
@@ -247,7 +362,28 @@ def print_results(results):
     print(f"{'='*70}\n")
 
 def compare_results(all_results):
-    """Compare results across different thread counts and identify optimal."""
+    """
+    Compare benchmark results across different thread counts.
+    
+    This function performs comparative analysis of multiple benchmark runs
+    to identify:
+    - Best overall throughput (votes per minute)
+    - Best per-thread efficiency
+    - Diminishing returns points (where adding threads provides <10% improvement)
+    - Recommended optimal thread count
+    
+    Args:
+        all_results (list): List of result dictionaries from run_benchmark()
+            Each dictionary should contain results for a different thread count.
+            Results should be sorted by thread count for best analysis.
+    
+    Returns:
+        None: This function prints analysis to stdout
+    
+    Note:
+        The function identifies diminishing returns by comparing sequential
+        thread counts and flagging when improvement drops below 10%.
+    """
     print(f"\n{'='*70}")
     print("COMPARATIVE ANALYSIS")
     print(f"{'='*70}\n")
@@ -325,7 +461,28 @@ def compare_results(all_results):
     print(f"\n{'='*70}\n")
 
 def main():
-    """Main benchmarking function."""
+    """
+    Main entry point for the benchmarking tool.
+    
+    This function:
+    1. Parses command-line arguments (thread counts, duration)
+    2. Validates arguments and checks for required dependencies
+    3. Runs benchmarks for each specified thread count
+    4. Collects and compares results
+    5. Displays recommendations
+    
+    Command-line Arguments:
+        --threads: Comma-separated list of thread counts (e.g., "1,2,3,4,5")
+        --duration: Duration in seconds for each benchmark (default: 300)
+        --skip-existing: Skip threads that already have results (unused currently)
+    
+    Returns:
+        None: Exits with code 0 on success, 1 on error
+    
+    Note:
+        The function handles KeyboardInterrupt gracefully and will display
+        results for completed benchmarks before exiting.
+    """
     parser = argparse.ArgumentParser(
         description='Benchmark voting performance at different thread counts'
     )
