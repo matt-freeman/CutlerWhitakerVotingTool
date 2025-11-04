@@ -9,6 +9,7 @@ This module provides automated voting functionality with the following features:
 - Centralized status display showing all active voting threads
 - Exponential backoff when Cutler's lead exceeds a threshold
 - Thread-safe counters and vote tracking
+- JSON logging of all vote activity to voting_activity.json
 - Graceful shutdown on Ctrl+C
 - Result extraction and display
 
@@ -43,6 +44,7 @@ import sys
 import argparse
 import random
 import threading
+import uuid
 
 VOTE_URL = "https://www.si.com/high-school/national/vote-who-should-be-high-school-on-si-national-boys-athlete-of-the-week-11-3-2025"
 TARGET_ATHLETE = "Cutler Whitaker"
@@ -86,6 +88,12 @@ initial_accelerated_vote_count = 0  # Votes when Cutler is behind 1-4 rounds
 lead_backoff_multiplier = 1.0  # Exponential backoff multiplier when lead is high
 lead_backoff_lock = threading.Lock()  # Lock for backoff state
 MAX_BACKOFF_DELAY = 300  # Maximum delay: 5 minutes (300 seconds)
+
+# JSON logging file
+JSON_LOG_FILE = 'voting_activity.json'  # File to store vote activity summary
+_json_log_lock = threading.Lock()  # Lock for thread-safe JSON file writes
+_current_session_id = None  # Unique session identifier for this run
+_save_top_results = False  # Whether to save top_5_results in JSON (default: False to keep file size down)
 
 def status_display_manager():
     """
@@ -197,6 +205,280 @@ def stop_status_display():
         _thread_status.clear()
     # Clear the status display area
     print('\r' + ' ' * 80 + '\r', end='', flush=True)
+
+def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ahead, 
+                     consecutive_behind_count, vote_type, lead_percentage=None, is_backoff_vote=False, 
+                     save_top_results=False):
+    """
+    Log vote details to a JSON file for activity tracking.
+    
+    This function writes vote information to a JSON file that maintains a summary
+    of all voting activity. Each vote is appended to a list in the JSON file,
+    creating a chronological record of all votes cast. The summary statistics are
+    automatically updated with each vote. The file is preserved across restarts,
+    with new sessions appending to existing data.
+    
+    The JSON file structure:
+    {
+        "session_start": "YYYY-MM-DD HH:MM:SS",  # First session start time (preserved)
+        "target_athlete": "Cutler Whitaker",
+        "summary": {
+            "total_votes_submitted": int,
+            "standard_votes": int,
+            "initial_accelerated_votes": int,
+            "accelerated_votes": int,
+            "super_accelerated_votes": int,
+            "exponential_backoff_votes": int
+        },
+        "votes": [
+            {
+                "vote_number": int,  # Session-scoped (resets each session)
+                "session_id": str,    # Unique session identifier
+                "thread_id": str,
+                "timestamp": "YYYY-MM-DD HH:MM:SS",
+                "success": bool,
+                "cutler_ahead": bool,
+                "cutler_position": int (1-based, or null if not found),
+                "cutler_percentage": float (or null),
+                "consecutive_behind_count": int,
+                "vote_type": str,
+                "lead_percentage": float (or null, only if cutler_ahead),
+                "exponential_backoff": bool,
+                "top_5_results": [  # Only included if --save-top-results flag is used
+                    {"athlete": str, "percentage": float},
+                    ...
+                ]
+            },
+            ...
+        ]
+    }
+    
+    Args:
+        vote_num (int): Vote number (sequential)
+        thread_id (str): Thread identifier (e.g., "Main", "Parallel-1")
+        timestamp (str): ISO format timestamp of the vote
+        success (bool): Whether the vote was successfully submitted
+        results (list): List of (athlete_name, percentage) tuples, or None
+        cutler_ahead (bool): Whether Cutler is in first place
+        consecutive_behind_count (int): Current consecutive rounds behind count
+        vote_type (str): Type of vote ("standard", "initial_accelerated", "accelerated", "super_accelerated")
+        lead_percentage (float, optional): Cutler's lead percentage if ahead, None otherwise
+        is_backoff_vote (bool, optional): Whether this vote was cast during exponential backoff
+        save_top_results (bool, optional): Whether to include top_5_results in the vote entry.
+            Defaults to False to keep file size down. Uses global _save_top_results flag.
+            Note: This parameter is kept for compatibility but the global flag is used instead.
+    
+    Returns:
+        None: This function only writes to file
+    
+    Thread Safety:
+        This function is fully thread-safe. It uses _json_log_lock to ensure that
+        the entire read-modify-write operation is atomic. Multiple threads can call
+        this function concurrently without risk of file corruption or data loss.
+        The lock ensures that:
+        1. Only one thread can read the file at a time
+        2. Only one thread can modify and write the file at a time
+        3. The summary statistics are calculated and updated atomically
+    """
+    global JSON_LOG_FILE, _json_log_lock, _current_session_id, _save_top_results
+    
+    # Session ID should already be initialized in main(), but provide fallback
+    if _current_session_id is None:
+        # Fallback: Generate unique session ID (timestamp + random component)
+        _current_session_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    
+    # Determine Cutler's position and percentage
+    cutler_position = None
+    cutler_percentage = None
+    top_5_results = []
+    
+    if results:
+        # Find Cutler's position (1-based index)
+        for idx, (name, percentage) in enumerate(results, 1):
+            name_lower = name.lower()
+            if 'cutler' in name_lower and 'whitaker' in name_lower:
+                cutler_position = idx
+                cutler_percentage = percentage
+                break
+        
+        # Get top 5 results for summary (only if save_top_results is enabled)
+        if _save_top_results:
+            top_5_results = [
+                {"athlete": name, "percentage": round(pct, 2)}
+                for name, pct in results[:5]
+            ]
+    
+    # Build vote entry
+    vote_entry = {
+        "vote_number": vote_num,  # Session-scoped vote number (resets each session)
+        "session_id": _current_session_id,  # Unique session identifier
+        "thread_id": thread_id,
+        "timestamp": timestamp,
+        "success": success,
+        "cutler_ahead": cutler_ahead,
+        "cutler_position": cutler_position,
+        "cutler_percentage": round(cutler_percentage, 2) if cutler_percentage is not None else None,
+        "consecutive_behind_count": consecutive_behind_count,
+        "vote_type": vote_type,
+        "lead_percentage": round(lead_percentage, 2) if lead_percentage is not None else None,
+        "exponential_backoff": is_backoff_vote
+    }
+    
+    # Only include top_5_results if save_top_results is True (to keep file size down)
+    # Use global flag instead of parameter to avoid threading issues
+    if _save_top_results:
+        vote_entry["top_5_results"] = top_5_results
+    
+    # Thread-safe JSON file write
+    # The entire read-modify-write operation is protected by _json_log_lock
+    # This ensures atomicity and prevents corruption when multiple threads write simultaneously
+    with _json_log_lock:
+        try:
+            # Try to read existing file
+            try:
+                with open(JSON_LOG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # IMPORTANT: Preserve original session_start timestamp (don't overwrite)
+                # This ensures the file tracks the first session start time
+                # New sessions will append votes but keep the original session_start
+                
+                # Ensure summary exists (handle old format without summary)
+                if "summary" not in data:
+                    data["summary"] = {
+                        "total_votes_submitted": 0,
+                        "standard_votes": 0,
+                        "initial_accelerated_votes": 0,
+                        "accelerated_votes": 0,
+                        "super_accelerated_votes": 0,
+                        "exponential_backoff_votes": 0
+                    }
+                # Ensure exponential_backoff_votes exists in summary (for old format)
+                if "exponential_backoff_votes" not in data["summary"]:
+                    data["summary"]["exponential_backoff_votes"] = 0
+                
+                # Ensure session_start exists (for old format)
+                if "session_start" not in data:
+                    data["session_start"] = timestamp
+                    data["target_athlete"] = TARGET_ATHLETE
+                
+                # Ensure votes array exists (for old format)
+                if "votes" not in data:
+                    data["votes"] = []
+                
+            except (FileNotFoundError, json.JSONDecodeError):
+                # File doesn't exist or is corrupted - create new structure
+                data = {
+                    "session_start": timestamp,  # First session start time
+                    "target_athlete": TARGET_ATHLETE,
+                    "summary": {
+                        "total_votes_submitted": 0,
+                        "standard_votes": 0,
+                        "initial_accelerated_votes": 0,
+                        "accelerated_votes": 0,
+                        "super_accelerated_votes": 0,
+                        "exponential_backoff_votes": 0
+                    },
+                    "votes": []
+                }
+            
+            # Get existing summary BEFORE appending new vote (for historical totals preservation)
+            existing_summary = data.get("summary", {})
+            
+            # Calculate summary from existing votes BEFORE adding the new vote
+            # This gives us the baseline from votes currently in the file
+            summary_before = {
+                "total_votes_submitted": 0,
+                "standard_votes": 0,
+                "initial_accelerated_votes": 0,
+                "accelerated_votes": 0,
+                "super_accelerated_votes": 0,
+                "exponential_backoff_votes": 0
+            }
+            
+            # Count existing votes by type
+            for vote in data["votes"]:
+                if vote.get("success", False):
+                    summary_before["total_votes_submitted"] += 1
+                
+                vote_type_in_entry = vote.get("vote_type", "standard")
+                if vote_type_in_entry == "standard":
+                    summary_before["standard_votes"] += 1
+                elif vote_type_in_entry == "initial_accelerated":
+                    summary_before["initial_accelerated_votes"] += 1
+                elif vote_type_in_entry == "accelerated":
+                    summary_before["accelerated_votes"] += 1
+                elif vote_type_in_entry == "super_accelerated":
+                    summary_before["super_accelerated_votes"] += 1
+                
+                if vote.get("exponential_backoff", False):
+                    summary_before["exponential_backoff_votes"] += 1
+            
+            # Append new vote entry
+            data["votes"].append(vote_entry)
+            
+            # Calculate increment for this new vote
+            # This is what we need to add to the existing summary
+            increment = {
+                "total_votes_submitted": 0,
+                "standard_votes": 0,
+                "initial_accelerated_votes": 0,
+                "accelerated_votes": 0,
+                "super_accelerated_votes": 0,
+                "exponential_backoff_votes": 0
+            }
+            
+            # Increment based on the new vote being added
+            if vote_entry.get("success", False):
+                increment["total_votes_submitted"] = 1
+            
+            vote_type_in_entry = vote_entry.get("vote_type", "standard")
+            if vote_type_in_entry == "standard":
+                increment["standard_votes"] = 1
+            elif vote_type_in_entry == "initial_accelerated":
+                increment["initial_accelerated_votes"] = 1
+            elif vote_type_in_entry == "accelerated":
+                increment["accelerated_votes"] = 1
+            elif vote_type_in_entry == "super_accelerated":
+                increment["super_accelerated_votes"] = 1
+            
+            if vote_entry.get("exponential_backoff", False):
+                increment["exponential_backoff_votes"] = 1
+            
+            # Calculate the difference between historical totals and current file totals
+            # This represents votes that were manually added as historical data
+            historical_offset = {
+                "total_votes_submitted": max(0, existing_summary.get("total_votes_submitted", 0) - summary_before["total_votes_submitted"]),
+                "standard_votes": max(0, existing_summary.get("standard_votes", 0) - summary_before["standard_votes"]),
+                "initial_accelerated_votes": max(0, existing_summary.get("initial_accelerated_votes", 0) - summary_before["initial_accelerated_votes"]),
+                "accelerated_votes": max(0, existing_summary.get("accelerated_votes", 0) - summary_before["accelerated_votes"]),
+                "super_accelerated_votes": max(0, existing_summary.get("super_accelerated_votes", 0) - summary_before["super_accelerated_votes"]),
+                "exponential_backoff_votes": max(0, existing_summary.get("exponential_backoff_votes", 0) - summary_before["exponential_backoff_votes"])
+            }
+            
+            # Final summary = historical offset + current file totals + new vote increment
+            final_summary = {
+                "total_votes_submitted": historical_offset["total_votes_submitted"] + summary_before["total_votes_submitted"] + increment["total_votes_submitted"],
+                "standard_votes": historical_offset["standard_votes"] + summary_before["standard_votes"] + increment["standard_votes"],
+                "initial_accelerated_votes": historical_offset["initial_accelerated_votes"] + summary_before["initial_accelerated_votes"] + increment["initial_accelerated_votes"],
+                "accelerated_votes": historical_offset["accelerated_votes"] + summary_before["accelerated_votes"] + increment["accelerated_votes"],
+                "super_accelerated_votes": historical_offset["super_accelerated_votes"] + summary_before["super_accelerated_votes"] + increment["super_accelerated_votes"],
+                "exponential_backoff_votes": historical_offset["exponential_backoff_votes"] + summary_before["exponential_backoff_votes"] + increment["exponential_backoff_votes"]
+            }
+            
+            # Update summary in data structure (preserving historical totals and incrementing)
+            data["summary"] = final_summary
+            
+            # Write back to file (atomic write operation)
+            with open(JSON_LOG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        except Exception as e:
+            # Log error but don't crash the voting process
+            # This ensures that voting can continue even if JSON logging fails
+            debug_print(f"⚠ Error writing to JSON log: {e}")
+            import traceback
+            debug_print(traceback.format_exc())
 
 def debug_print(*args, **kwargs):
     """
@@ -1401,12 +1683,17 @@ def perform_vote_iteration(thread_id="Main"):
     # Clear status after vote completes
     update_thread_status(thread_id, 'completed')
     
+    # Get current timestamp for logging
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    
     if success:
         print(f"[{thread_id}] ✓ Vote #{current_vote_num} submitted successfully!")
         
         # Try to extract and display results
         results = None
         cutler_ahead = False
+        vote_type = "standard"  # Default vote type
+        lead_percentage = None
         
         try:
             with open('vote_result.html', 'r', encoding='utf-8') as f:
@@ -1424,6 +1711,7 @@ def perform_vote_iteration(thread_id="Main"):
                     if cutler_ahead:
                         consecutive_behind_count = 0
                         standard_vote_count += 1
+                        vote_type = "standard"
                         if thread_id == "Main":
                             print(f"✓ {TARGET_ATHLETE} is in FIRST PLACE! Using standard interval.")
                     else:
@@ -1431,16 +1719,25 @@ def perform_vote_iteration(thread_id="Main"):
                         current_behind = consecutive_behind_count
                         if current_behind >= 10:
                             super_accelerated_vote_count += 1
+                            vote_type = "super_accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using SUPER ACCELERATED voting!")
                         elif current_behind >= 5:
                             accelerated_vote_count += 1
+                            vote_type = "accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using accelerated voting.")
                         else:
                             initial_accelerated_vote_count += 1
+                            vote_type = "initial_accelerated"
                             if thread_id == "Main":
                                 print(f"⚠ {TARGET_ATHLETE} is not in first place ({current_behind}/5 rounds behind). Using initial accelerated voting.")
+                
+                # Calculate lead percentage if Cutler is ahead (for logging)
+                if cutler_ahead and results and len(results) >= 2:
+                    cutler_percentage = results[0][1]
+                    second_place_percentage = results[1][1]
+                    lead_percentage = cutler_percentage - second_place_percentage
                 
                 # Note: Lead percentage checking and backoff adjustment happens in main() after this function returns
             else:
@@ -1448,19 +1745,63 @@ def perform_vote_iteration(thread_id="Main"):
                     print("⚠ Could not extract results from page")
                 with _counter_lock:
                     standard_vote_count += 1
+                    vote_type = "standard"
         except FileNotFoundError:
             if thread_id == "Main":
                 print("⚠ Result file not found, skipping result extraction")
             with _counter_lock:
                 standard_vote_count += 1
+                vote_type = "standard"
         except Exception as e:
             if thread_id == "Main":
                 print(f"⚠ Error extracting results: {e}")
             with _counter_lock:
                 standard_vote_count += 1
+                vote_type = "standard"
     else:
         if thread_id == "Main":
             print(f"⚠ Vote #{current_vote_num} failed")
+        # For failed votes, determine vote type based on current behind count
+        with _counter_lock:
+            current_behind = consecutive_behind_count
+            if current_behind >= 10:
+                vote_type = "super_accelerated"
+            elif current_behind >= 5:
+                vote_type = "accelerated"
+            elif current_behind >= 1:
+                vote_type = "initial_accelerated"
+            else:
+                vote_type = "standard"
+    
+    # Determine if this vote was cast during exponential backoff
+    # Backoff is active when Cutler is ahead, has a lead percentage, and the backoff multiplier is > 1.0
+    # We check the multiplier BEFORE the main loop updates it, so we capture the state when this vote was cast
+    is_backoff_active = False
+    if cutler_ahead and lead_percentage is not None:
+        # Check the current backoff multiplier (thread-safe)
+        # This value reflects the multiplier state BEFORE this vote was cast
+        # (since the main loop updates it after perform_vote_iteration returns)
+        with lead_backoff_lock:
+            current_backoff = lead_backoff_multiplier
+        # If multiplier > 1.0, it means backoff was active when this vote cycle started
+        # This vote was cast during a backoff period
+        is_backoff_active = (current_backoff > 1.0)
+    
+    # Log vote to JSON file (thread-safe)
+    with _counter_lock:
+        current_behind_for_log = consecutive_behind_count
+    log_vote_to_json(
+        vote_num=current_vote_num,
+        thread_id=thread_id,
+        timestamp=timestamp,
+        success=success,
+        results=results,
+        cutler_ahead=cutler_ahead if success else False,
+        consecutive_behind_count=current_behind_for_log,
+        vote_type=vote_type,
+        lead_percentage=lead_percentage,
+        is_backoff_vote=is_backoff_active
+    )
     
     return success, results, cutler_ahead
 
@@ -1698,12 +2039,19 @@ def main():
     parser.add_argument('--lead-threshold', type=float, default=15.0,
                        help='Percentage lead threshold to trigger backoff (default: 15.0). '
                             'When Cutler is ahead by this percentage or more, exponential backoff is used.')
+    parser.add_argument('--save-top-results', action='store_true', default=False,
+                       help='Save top 5 results for each vote in JSON file (default: False). '
+                            'Disable to keep file size smaller on long runs.')
     args = parser.parse_args()
     
     # Set debug mode based on command-line argument
     debug_mode = args.debug
     start_thread_count = args.start_threads
     lead_threshold = args.lead_threshold
+    
+    # Set global flag for saving top results in JSON
+    global _save_top_results
+    _save_top_results = args.save_top_results
     
     # Set up signal handler for graceful shutdown on Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
@@ -1751,6 +2099,15 @@ def main():
     accelerated_vote_count = 0  # Votes when Cutler is behind 5-9 rounds
     super_accelerated_vote_count = 0  # Votes when Cutler is behind 10+ rounds
     initial_accelerated_vote_count = 0  # Votes when Cutler is behind 1-4 rounds
+    
+    # Initialize session ID for JSON logging (unique per application run)
+    # This prevents duplicate vote numbers from being confusing across restarts
+    # Each restart gets a new session_id, but vote_number resets to 1 for each session
+    global _current_session_id
+    if _current_session_id is None:
+        session_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        _current_session_id = f"{session_start_time}_{uuid.uuid4().hex[:8]}"
+        debug_print(f"Session ID: {_current_session_id}")
     
     # Start centralized status display
     start_status_display()
