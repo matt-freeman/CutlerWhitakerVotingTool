@@ -193,6 +193,7 @@ def update_thread_status(thread_id, status, vote_num=0):
         elif status == 'idle':
             if thread_id in _thread_status:
                 del _thread_status[thread_id]
+        
 
 def start_status_display():
     """Start the centralized status display thread."""
@@ -725,6 +726,10 @@ def submit_vote_selenium():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])  # Anti-detection
     chrome_options.add_experimental_option('useAutomationExtension', False)  # Disable automation extension
     
+    # Initialize driver to None to ensure cleanup in finally block
+    driver = None
+    service = None
+    
     try:
         # Try to use ChromeDriver from environment variable or common locations
         # This helps with systems that have GLIBC compatibility issues with selenium-manager
@@ -738,6 +743,7 @@ def submit_vote_selenium():
                 chromedriver_init_start = time.time()
                 service = Service(chromedriver_path)
                 driver = webdriver.Chrome(service=service, options=chrome_options)
+                # Service is now tracked for cleanup
                 chromedriver_init_elapsed = time.time() - chromedriver_init_start
                 debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
             else:
@@ -793,6 +799,7 @@ def submit_vote_selenium():
                     chromedriver_init_start = time.time()
                     service = Service(path)
                     driver = webdriver.Chrome(service=service, options=chrome_options)
+                    # Service is now tracked for cleanup
                     chromedriver_init_elapsed = time.time() - chromedriver_init_start
                     debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
                     chromedriver_found = True
@@ -1027,6 +1034,60 @@ def submit_vote_selenium():
             debug_print(f"[PERF] Iframe detection failed after {iframe_elapsed:.2f}s")
             debug_print(f"Error finding iframes: {e}")
         
+        # Wait for voting widget to be fully loaded and interactive
+        # This prevents searching for elements before React/JavaScript has finished rendering
+        widget_wait_start = time.time()
+        debug_print("[PERF] Waiting for voting widget to be ready...")
+        try:
+            # Wait for voting widget container or key elements to be present and visible
+            # Try multiple selectors that indicate the widget is loaded
+            widget_ready = False
+            widget_selectors = [
+                "input[type='radio']",  # Radio buttons indicate widget is loaded
+                "button.css-vote-button",  # Vote button class
+                "button.pds-vote-button",  # Alternative vote button class
+                "button[id*='vote']",  # Vote button with ID containing 'vote'
+                ".pds-radiobutton",  # Radio button container
+            ]
+            
+            max_widget_wait = 5  # Maximum 5 seconds to wait for widget
+            widget_wait_elapsed = 0
+            wait_interval = 0.2
+            
+            while widget_wait_elapsed < max_widget_wait and not widget_ready:
+                for selector in widget_selectors:
+                    try:
+                        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                        # Check if at least one element is visible and interactive
+                        for elem in elements[:5]:  # Check first 5 elements
+                            try:
+                                if elem.is_displayed() and elem.is_enabled():
+                                    # Found a visible, interactive element - widget is ready
+                                    widget_ready = True
+                                    debug_print(f"[PERF] Voting widget ready (found: {selector})")
+                                    break
+                            except:
+                                continue
+                        if widget_ready:
+                            break
+                    except:
+                        continue
+                if widget_ready:
+                    break
+                
+                time.sleep(wait_interval)
+                widget_wait_elapsed += wait_interval
+            
+            if not widget_ready:
+                debug_print(f"[PERF] Widget wait timeout after {widget_wait_elapsed:.2f}s, proceeding anyway")
+            
+            widget_wait_total = time.time() - widget_wait_start
+            debug_print(f"[PERF] Widget ready check completed in {widget_wait_total:.2f} seconds")
+        except Exception as e:
+            widget_wait_total = time.time() - widget_wait_start
+            debug_print(f"[PERF] Widget wait error after {widget_wait_total:.2f}s: {e}")
+            # Continue anyway - might still work
+        
         # Try multiple strategies to find the vote button for Cutler Whitaker
         # We use multiple strategies because different sites structure their polls differently
         # If one strategy fails, we try the next one until we find the element
@@ -1093,22 +1154,32 @@ def submit_vote_selenium():
                         for elem_idx, elem in enumerate(elements, 1):
                             try:
                                 elem_check_start = time.time()
-                                if elem.is_displayed() and elem.is_enabled():
-                                    elem_check_elapsed = time.time() - elem_check_start
-                                    elem_text = elem.text[:50] if elem.text else 'N/A'
-                                    elem_tag = elem.tag_name
-                                    debug_print(f"[PERF] Element {elem_idx} check took {elem_check_elapsed:.3f}s")
-                                    debug_print(f"Found clickable element: {elem_tag}, text='{elem_text}'")
-                                    # For buttons, make sure it's not a menu button
-                                    if elem_tag == 'button':
-                                        btn_id = elem.get_attribute('id') or ''
-                                        btn_class = elem.get_attribute('class') or ''
-                                        if any(skip in btn_id.lower() or skip in btn_class.lower() 
-                                               for skip in ['menu', 'nav', 'hamburger', 'more']):
-                                            debug_print(f"  Skipping (looks like menu button)")
-                                            continue
-                                    vote_button = elem
-                                    break
+                                # Wait for element to be clickable, not just present
+                                # This ensures React/JavaScript has finished making it interactive
+                                try:
+                                    # Use WebDriverWait to ensure element is clickable
+                                    wait_elem = WebDriverWait(driver, 1)
+                                    wait_elem.until(EC.element_to_be_clickable(elem))
+                                except:
+                                    # If WebDriverWait fails, fall back to basic checks
+                                    if not elem.is_displayed() or not elem.is_enabled():
+                                        continue
+                                
+                                elem_check_elapsed = time.time() - elem_check_start
+                                elem_text = elem.text[:50] if elem.text else 'N/A'
+                                elem_tag = elem.tag_name
+                                debug_print(f"[PERF] Element {elem_idx} check took {elem_check_elapsed:.3f}s (clickable)")
+                                debug_print(f"Found clickable element: {elem_tag}, text='{elem_text}'")
+                                # For buttons, make sure it's not a menu button
+                                if elem_tag == 'button':
+                                    btn_id = elem.get_attribute('id') or ''
+                                    btn_class = elem.get_attribute('class') or ''
+                                    if any(skip in btn_id.lower() or skip in btn_class.lower() 
+                                           for skip in ['menu', 'nav', 'hamburger', 'more']):
+                                        debug_print(f"  Skipping (looks like menu button)")
+                                        continue
+                                vote_button = elem
+                                break
                             except Exception as e:
                                 debug_print(f"[PERF] Element {elem_idx} check failed: {e}")
                                 continue
@@ -1525,9 +1596,7 @@ def submit_vote_selenium():
                 if 'thank' in page_text or 'success' in page_text or 'voted' in page_text:
                     debug_print("✓ Vote appears to have been submitted successfully!")
                 
-                driver.quit()
-                vote_function_elapsed = time.time() - vote_function_start
-                debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
+                # Note: Performance timing and driver.quit() are now handled in finally block for guaranteed execution
                 return True
             except Exception as e:
                 print(f"Error clicking button: {e}")
@@ -1637,9 +1706,7 @@ def submit_vote_selenium():
                     if 'thank' in page_text or 'success' in page_text or 'voted' in page_text:
                         debug_print("✓ Vote appears to have been submitted successfully!")
                     
-                    driver.quit()
-                    vote_function_elapsed = time.time() - vote_function_start
-                    debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
+                    # Note: Performance timing and driver.quit() are now handled in finally block for guaranteed execution
                     return True
                 except Exception as e2:
                     print(f"JavaScript click also failed: {e2}")
@@ -1648,24 +1715,72 @@ def submit_vote_selenium():
             print("Page source saved to page_source.html for manual inspection")
         
         # Switch back to default content if we were in an iframe
-        if in_iframe:
+        if in_iframe and driver is not None:
             try:
                 driver.switch_to.default_content()
             except:
                 pass
         
-        driver.quit()
-        vote_function_elapsed = time.time() - vote_function_start
-        debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds (failed)")
+        # Note: Performance timing and driver.quit() are now handled in finally block for guaranteed execution
         return False
             
     except Exception as e:
-        vote_function_elapsed = time.time() - vote_function_start
-        debug_print(f"[PERF] submit_vote_selenium() failed after {vote_function_elapsed:.2f} seconds")
         print(f"Selenium error: {e}")
         import traceback
         traceback.print_exc()
         return False
+    
+    finally:
+        # CRITICAL: Always print performance timing and clean up WebDriver
+        # This ensures these messages appear even if exceptions occur
+        vote_function_elapsed = time.time() - vote_function_start
+        
+        # Determine if this was a success or failure by checking if we have a result
+        # (This is a best-effort check - the actual return value determines success/failure)
+        try:
+            if os.path.exists('vote_result.html'):
+                # Check if result file indicates success
+                try:
+                    with open('vote_result.html', 'r', encoding='utf-8') as f:
+                        result_content = f.read().lower()
+                        if 'thank' in result_content or 'success' in result_content or 'voted' in result_content:
+                            debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
+                        else:
+                            debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds (may have failed)")
+                except:
+                    debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
+            else:
+                debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds (failed)")
+        except:
+            # Fallback: always print timing even if we can't determine status
+            debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
+        
+        # CRITICAL: Always clean up WebDriver to prevent memory leaks and orphaned processes
+        # This ensures Chrome/ChromeDriver processes are terminated even on exceptions
+        if driver is not None:
+            try:
+                driver.quit()
+                debug_print("[CLEANUP] WebDriver cleaned up successfully")
+            except Exception as cleanup_error:
+                # If quit() fails, try to kill the process directly
+                debug_print(f"[CLEANUP] WebDriver.quit() failed: {cleanup_error}")
+                try:
+                    # Attempt to kill Chrome processes as fallback
+                    import gc
+                    gc.collect()  # Force garbage collection
+                except:
+                    pass
+        
+        # Clean up service object if it exists
+        if service is not None:
+            try:
+                service.stop()
+            except:
+                pass
+        
+        # Force garbage collection to help release Selenium objects
+        import gc
+        gc.collect()
 
 def extract_voting_results(html_content):
     """
@@ -2363,7 +2478,19 @@ def main():
     
     try:
         # Main voting loop - continues until shutdown_flag is set (Ctrl+C)
+        last_gc_time = time.time()  # Track last garbage collection time
+        gc_interval = 300  # Run garbage collection every 5 minutes (300 seconds)
+        
         while not shutdown_flag:
+            # Periodic memory cleanup for long-running sessions
+            current_time = time.time()
+            if current_time - last_gc_time > gc_interval:
+                import gc
+                debug_print("[CLEANUP] Running periodic garbage collection...")
+                gc.collect()
+                last_gc_time = current_time
+                debug_print("[CLEANUP] Garbage collection completed")
+            
             # Perform vote iteration
             success, results, cutler_ahead = perform_vote_iteration(thread_id="Main")
             
