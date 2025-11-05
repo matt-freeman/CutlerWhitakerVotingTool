@@ -12,11 +12,26 @@ An automated tool to continuously submit votes for **Cutler Whitaker** on the Sp
   - **Behind (1-4 rounds)**: Random interval between 14-37 seconds (Initial Accelerated)
   - **Behind (5-9 rounds)**: Random interval between 7-16 seconds (Accelerated)
   - **Behind (10+ rounds)**: Random interval between 3-10 seconds (Super Accelerated)
-- **Parallel processing**: When Cutler is behind 20+ consecutive rounds, additional voting threads start automatically:
+- **Parallel processing**: When Cutler is behind, additional voting threads start automatically:
   - **20+ rounds**: Second thread starts (2x speed)
   - **30+ rounds**: Third thread starts (3x speed)
+  - **40+ rounds**: Fourth thread starts (4x speed)
+  - **50+ rounds**: Fifth thread starts (5x speed)
+  - **60+ rounds**: Sixth thread starts (6x speed)
+  - **70+ rounds**: Seventh thread starts (7x speed)
+  - **80+ rounds**: Eighth thread starts (8x speed)
+  - Additional threads continue at 90+, 100+, etc. (scalable design)
+  - Default maximum: 8 total threads (1 main + 7 parallel), configurable via `--max-threads`
+  - All parallel threads use Super Accelerated timing (3-10 seconds)
+  - Threads automatically stop when Cutler gets ahead (unless `--force-parallel` is used)
+  - **Scalable design**: Supports any number of threads without code changes
+- **Force parallel mode**: Keep parallel threads active regardless of Cutler's position
+- **Centralized status display**: Shows all active voting threads simultaneously with processing indicators
+- **Exponential backoff**: Prevents pushing Cutler's lead too high with configurable threshold
+- **JSON logging**: Logs all vote activity to `voting_activity.json` with summary statistics
+- **Thread-safe operations**: All counters and file operations are thread-safe
 - **Debug mode**: Optional verbose logging for troubleshooting
-- **Graceful shutdown**: Handles Ctrl+C cleanly
+- **Graceful shutdown**: Handles Ctrl+C cleanly with statistics summary
 - **Processing indicator**: Visual feedback showing the script is working
 
 ## Setup
@@ -28,8 +43,26 @@ pip install -r requirements.txt
 
 2. **Install ChromeDriver** (required for Selenium):
    - **macOS**: `brew install chromedriver`
-   - **Linux**: Download from https://chromedriver.chromium.org/
-   - **Windows**: Download from https://chromedriver.chromium.org/ and add to PATH
+   - **Linux**: 
+     - Download from https://chromedriver.chromium.org/
+     - Install to `/usr/local/bin/chromedriver` or another location in PATH
+     - Make executable: `chmod +x /usr/local/bin/chromedriver`
+     - **For systems with old GLIBC versions** (e.g., Raspberry Pi with older OS):
+       - Download ChromeDriver manually and place it in a known location
+       - Set the `CHROMEDRIVER_PATH` environment variable:
+         ```bash
+         export CHROMEDRIVER_PATH=/path/to/chromedriver
+         ```
+   - **Windows**: 
+     - Download `chromedriver.exe` from https://chromedriver.chromium.org/
+     - Extract to a folder (e.g., `C:\chromedriver`)
+     - Add that folder to your system PATH, OR
+     - Set the `CHROMEDRIVER_PATH` environment variable:
+       ```cmd
+       set CHROMEDRIVER_PATH=C:\path\to\chromedriver.exe
+       python vote.py
+       ```
+     - The script will also check common Windows locations automatically
 
 ## Usage
 
@@ -113,21 +146,35 @@ Example: If standard interval is 60 seconds and backoff multiplier reaches 2.0x,
 
 ### Parallel Processing
 
-When Cutler has been behind for extended periods, the script automatically starts additional voting threads to accelerate voting:
+When Cutler has been behind for extended periods, the script automatically starts additional voting threads to accelerate voting. The system uses a **scalable design** that supports any number of threads without code changes.
 
-- **First Parallel Thread** (starts at 20+ rounds behind):
-  - Trigger: 20 consecutive rounds behind
-  - Behavior: Second thread starts voting using Super Accelerated timing (3-10 seconds)
-  - Result: Approximately **2x voting speed** (main + 1 parallel thread)
-  - Auto-stop: Stops automatically when Cutler returns to first place or drops below 20 rounds behind
+**Thread Thresholds** (automatic activation):
+- **Parallel-1**: Starts at 20+ rounds behind (2x speed)
+- **Parallel-2**: Starts at 30+ rounds behind (3x speed)
+- **Parallel-3**: Starts at 40+ rounds behind (4x speed)
+- **Parallel-4**: Starts at 50+ rounds behind (5x speed)
+- **Parallel-5**: Starts at 60+ rounds behind (6x speed)
+- **Parallel-6**: Starts at 70+ rounds behind (7x speed)
+- **Parallel-7**: Starts at 80+ rounds behind (8x speed)
+- Additional threads continue at 90+, 100+, etc. (threshold increments by 10 per thread)
 
-- **Second Parallel Thread** (starts at 30+ rounds behind):
-  - Trigger: 30 consecutive rounds behind
-  - Behavior: Third thread starts voting using Super Accelerated timing (3-10 seconds)
-  - Result: Approximately **3x voting speed** (main + 2 parallel threads)
-  - Auto-stop: Stops automatically when Cutler returns to first place or drops below 30 rounds behind
+**Default Configuration**:
+- Maximum threads: **8 total** (1 main + 7 parallel)
+- Configurable via `--max-threads` argument (see [Command Line Options](#command-line-options))
 
-All parallel threads use the same voting logic and thread-safe counters as the main thread, ensuring accurate vote tracking and statistics. All threads share the same result extraction and timing logic, working together seamlessly to catch up quickly when Cutler falls behind.
+**Behavior**:
+- Each parallel thread uses Super Accelerated timing (3-10 seconds between votes)
+- All threads use the same voting logic and thread-safe counters
+- Threads automatically stop when Cutler returns to first place or drops below their threshold
+- Threads share result extraction and timing logic, working together seamlessly
+
+**Scalable Design Benefits**:
+- No hardcoded thread limits - supports any number of threads
+- Thresholds calculated automatically (20, 30, 40, 50, 60, 70, 80, ...)
+- Easy to scale up or down by changing `--max-threads`
+- No code changes needed to add more threads
+
+**Force Parallel Mode**: Use the `--force-parallel` flag to keep parallel threads active even when Cutler is ahead. This maintains maximum voting speed regardless of position. See [Command Line Options](#command-line-options) below.
 
 ### Output Files
 
@@ -136,6 +183,11 @@ The script generates the following files:
 - `vote_result.html`: HTML of the results page after each vote
 - `vote_result.png`: Screenshot of the results page (if screenshot capture works)
 - `page_source.html`: Page source saved when manual inspection is needed
+- `voting_activity.json`: Comprehensive log of all voting activity with:
+  - Summary statistics (total votes, votes by type, exponential backoff votes)
+  - Individual vote entries with timestamps, thread IDs, success status, and results
+  - Optional top 5 results for each vote (enabled with `--save-top-results`)
+  - Historical totals preservation (supports manual editing of historical data)
 
 ## Output Example
 
@@ -179,39 +231,127 @@ VOTE STATISTICS:
 ============================================================
 ```
 
+## JSON Logging
+
+The script automatically logs all voting activity to `voting_activity.json`. This file contains:
+
+- **Summary Section**: Aggregated statistics including:
+  - Total votes submitted (successful votes only)
+  - Standard votes count
+  - Initial accelerated votes count
+  - Accelerated votes count
+  - Super accelerated votes count
+  - Exponential backoff votes count
+
+- **Individual Vote Entries**: Each vote includes:
+  - Vote number (sequential per session)
+  - Session ID (unique identifier for this run)
+  - Thread ID (Main, Parallel-1, Parallel-2, etc.)
+  - Timestamp
+  - Success status
+  - Cutler's position and percentage
+  - Consecutive behind count
+  - Vote type
+  - Lead percentage (if Cutler is ahead)
+  - Exponential backoff flag
+  - Top 5 results (optional, if `--save-top-results` is enabled)
+
+**Historical Totals Preservation**: The JSON file supports manually editing the summary section to include historical totals from previous runs. The script will preserve these totals and increment them correctly as new votes are added. This allows you to maintain cumulative statistics across multiple sessions.
+
+**File Size Management**: By default, `top_5_results` are not saved to keep file size manageable. Use `--save-top-results` only when you need detailed historical data.
+
 ## Command Line Options
 
 - `-debug` or `--debug`: Enable debug output (verbose logging)
-- `--start-threads N`: Start with N threads already active (1, 2, or 3)
-  - `1`: Main thread only (default, normal start)
+  - Shows detailed information about page loading, element detection, cookie handling, and voting operations
+  - Useful for troubleshooting when votes aren't being submitted correctly
+
+- `--start-threads N`: Start with N threads already active (default: 1)
+  - `1`: Main thread only (normal start)
   - `2`: Main + 1 parallel thread (starts as if Cutler is 20+ rounds behind)
   - `3`: Main + 2 parallel threads (starts as if Cutler is 30+ rounds behind)
+  - `4`: Main + 3 parallel threads (starts as if Cutler is 40+ rounds behind)
+  - `5`: Main + 4 parallel threads (starts as if Cutler is 50+ rounds behind)
+  - `6`: Main + 5 parallel threads (starts as if Cutler is 60+ rounds behind)
+  - `7`: Main + 6 parallel threads (starts as if Cutler is 70+ rounds behind)
+  - `8`: Main + 7 parallel threads (starts as if Cutler is 80+ rounds behind)
+  - Can be any number up to `--max-threads` value
   - Useful if you know Cutler is already behind and want to skip waiting for thresholds
+  - Automatically initializes the `consecutive_behind_count` to match the thread count
+
+- `--max-threads N`: Maximum number of total threads (main + parallel) (default: 8)
+  - Sets the maximum number of parallel threads that can be started
+  - Default: 8 (1 main + 7 parallel)
+  - Can be set to any number (e.g., 10, 15, 20, etc.)
+  - Must be >= `--start-threads` value
+  - Example: `--max-threads 10` allows up to 10 total threads (1 main + 9 parallel)
+  - The scalable design supports any number of threads without code changes
+
 - `--lead-threshold N`: Percentage lead threshold to trigger exponential backoff (default: 15.0)
   - When Cutler's lead exceeds this percentage, the script uses exponential backoff
   - Backoff increases delay gradually up to 5 minutes maximum
+  - Backoff resets to normal timing when lead drops below threshold
   - Useful to prevent pushing Cutler's lead too high
+  - Example: `--lead-threshold 20` sets the threshold to 20%
+
+- `--save-top-results`: Save top 5 results for each vote in JSON file (default: False)
+  - When enabled, each vote entry includes the top 5 voting results
+  - Increases JSON file size, so use only when you need detailed historical data
+  - Default behavior (False) keeps file size smaller on long runs
+  - Example: `python3 vote.py --save-top-results`
+
+- `--force-parallel`: Force parallel threads to stay active even when Cutler is ahead
+  - When enabled, parallel threads continue running regardless of Cutler's position
+  - Threads will not stop automatically when Cutler gets ahead or behind count drops
+  - Useful for maximum voting speed regardless of position
+  - Threads will still stop when you press Ctrl+C
+  - Example: `python3 vote.py --start-threads 5 --force-parallel`
 
 ### Example Usage
 
-Start with 3 threads immediately (skip waiting for thresholds):
+**Basic usage:**
 ```bash
-python3 vote.py --start-threads 3
+python3 vote.py
 ```
 
-Start with 2 threads and debug mode:
+**Start with 8 threads immediately (default maximum, skip waiting for thresholds):**
 ```bash
-python3 vote.py --start-threads 2 -debug
+python3 vote.py --start-threads 8
 ```
 
-Start with 20% lead threshold (instead of default 15%):
+**Support up to 10 threads and start with 5:**
 ```bash
-python3 vote.py --lead-threshold 20
+python3 vote.py --max-threads 10 --start-threads 5
 ```
 
-Combine options:
+**Start with 3 threads, force them to stay active, and enable debug mode:**
 ```bash
-python3 vote.py --start-threads 2 --lead-threshold 18 -debug
+python3 vote.py --start-threads 3 --force-parallel -debug
+```
+
+**Maximum speed mode (8 threads, force parallel, no backoff):**
+```bash
+python3 vote.py --start-threads 8 --force-parallel --lead-threshold 100
+```
+
+**Start with 2 threads and 20% lead threshold:**
+```bash
+python3 vote.py --start-threads 2 --lead-threshold 20
+```
+
+**Save top 5 results in JSON and enable debug mode:**
+```bash
+python3 vote.py --save-top-results -debug
+```
+
+**Maximum speed mode (5 threads, force parallel, no backoff):**
+```bash
+python3 vote.py --start-threads 5 --force-parallel --lead-threshold 100
+```
+
+**Combine multiple options:**
+```bash
+python3 vote.py --start-threads 2 --lead-threshold 18 --save-top-results -debug
 ```
 
 ## Stopping the Script
@@ -229,11 +369,30 @@ Press **Ctrl+C** to stop the script gracefully. The script will:
 - Check `page_source.html` for manual inspection
 - Try running with `-debug` flag to see detailed element detection
 
-### ChromeDriver not found
+### ChromeDriver not found or GLIBC compatibility issues
 
-- Ensure ChromeDriver is installed and in your PATH
-- On macOS: `brew install chromedriver`
-- Verify with: `chromedriver --version`
+- **Standard installation**:
+  - Ensure ChromeDriver is installed and in your PATH
+  - On macOS: `brew install chromedriver`
+  - Verify with: `chromedriver --version`
+
+- **For systems with old GLIBC versions** (e.g., Raspberry Pi, older Linux distributions):
+  - The script will automatically check for ChromeDriver in common locations
+  - If you get a GLIBC error, manually install ChromeDriver:
+    1. Download ChromeDriver from https://chromedriver.chromium.org/
+    2. Place it in a location like `/usr/local/bin/chromedriver`
+    3. Make it executable: `chmod +x /usr/local/bin/chromedriver`
+    4. Or set the `CHROMEDRIVER_PATH` environment variable:
+       ```bash
+       export CHROMEDRIVER_PATH=/path/to/chromedriver
+       python3 vote.py
+       ```
+  - The script checks these locations automatically:
+    - `/usr/local/bin/chromedriver`
+    - `/usr/bin/chromedriver`
+    - `/opt/chromedriver/chromedriver`
+    - `~/chromedriver`
+    - `./chromedriver` (in the script directory)
 
 ### Results not displaying correctly
 
@@ -264,6 +423,11 @@ Press **Ctrl+C** to stop the script gracefully. The script will:
 - The script automatically handles cookie consent and page overlays
 - Results are extracted and displayed after each successful vote
 - The script saves HTML and screenshots for verification
+- All counters and file operations are thread-safe for concurrent voting
+- Centralized status display shows all active threads simultaneously
+- JSON logging preserves historical totals when manually edited
+- Parallel threads automatically stop when Cutler gets ahead (unless `--force-parallel` is used)
+- Exponential backoff prevents pushing Cutler's lead too high
 
 ## License
 
