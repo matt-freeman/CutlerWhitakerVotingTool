@@ -79,6 +79,7 @@ _thread_status = {}  # Dictionary: thread_id -> {'status': str, 'vote_num': int,
 _status_lock = threading.Lock()  # Lock for thread status updates
 _status_display_thread = None  # Reference to the status display thread
 _status_display_active = False  # Flag to control status display thread
+_status_display_paused = False  # Flag to temporarily pause status updates (e.g., when printing results)
 
 # Global vote counters (thread-safe)
 vote_count = 0  # Total number of vote attempts
@@ -106,14 +107,40 @@ def status_display_manager():
     
     This thread continuously updates a multi-line display showing the status
     of all threads that are currently processing votes. Uses ANSI escape codes
-    to update specific lines without overwriting other output.
+    on Unix-like systems, or Windows-compatible output on Windows.
     """
     global _status_display_active
     spinner_chars = ['|', '/', '-', '\\']
     spinner_idx = 0
     last_line_count = 0  # Track how many lines we printed last time
     
+    # Detect Windows and ANSI support
+    is_windows = platform.system() == 'Windows'
+    ansi_supported = False
+    
+    # Try to enable ANSI support on Windows 10+ if available
+    if is_windows:
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Enable VT100 escape sequences for Windows 10+
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            hOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.wintypes.DWORD()
+            if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
+                ansi_supported = True
+        except:
+            # If we can't enable ANSI, fall back to simple output
+            ansi_supported = False
+    
     while _status_display_active:
+        # Check if status display is temporarily paused (e.g., during results printing)
+        with _status_lock:
+            if _status_display_paused:
+                time.sleep(0.1)  # Short sleep while paused
+                continue
+        
         with _status_lock:
             active_threads = list(_thread_status.keys())
         
@@ -139,34 +166,58 @@ def status_display_manager():
                 if status == 'processing':
                     status_lines.append(f"[{thread_id}] Processing Vote... {spinner}  (Vote #{vote_num})")
             
-            # Display all status lines using ANSI escape codes
+            # Display all status lines
             if status_lines:
-                # Move cursor up to overwrite previous status lines
-                if last_line_count > 0:
-                    # Move up by the number of lines we printed last time
-                    for _ in range(last_line_count):
-                        print('\033[A', end='')  # Move up one line
-                    print('\033[J', end='', flush=True)  # Clear from cursor to end
-                
-                # Print all status lines
-                for line in status_lines:
-                    print(line, flush=True)
-                
-                last_line_count = len(status_lines)
+                if ansi_supported or not is_windows:
+                    # Use ANSI escape codes for Unix-like systems or Windows with ANSI enabled
+                    if last_line_count > 0:
+                        # Move up by the number of lines we printed last time
+                        for _ in range(last_line_count):
+                            print('\033[A', end='')  # Move up one line
+                        print('\033[J', end='', flush=True)  # Clear from cursor to end
+                    
+                    # Print all status lines
+                    for line in status_lines:
+                        print(line, flush=True)
+                    
+                    last_line_count = len(status_lines)
+                else:
+                    # Windows without ANSI support: print each line with carriage return
+                    # This overwrites the same line for single-thread updates, or prints new lines for multi-thread
+                    if len(status_lines) == 1:
+                        # Single line: use carriage return to overwrite
+                        print(f'\r{status_lines[0]}', end='', flush=True)
+                    else:
+                        # Multiple lines: print each on new line (Windows doesn't support multi-line overwrite well)
+                        for line in status_lines:
+                            print(line, flush=True)
+                    last_line_count = len(status_lines)
             else:
                 # No active threads - clear previous output if any
+                if ansi_supported or not is_windows:
+                    if last_line_count > 0:
+                        for _ in range(last_line_count):
+                            print('\033[A', end='')
+                        print('\033[J', end='', flush=True)
+                        last_line_count = 0
+                else:
+                    # Windows: just print a blank line to clear
+                    if last_line_count > 0:
+                        print('\r' + ' ' * 80 + '\r', end='', flush=True)
+                        last_line_count = 0
+        else:
+            # No active threads - clear previous output if any
+            if ansi_supported or not is_windows:
                 if last_line_count > 0:
                     for _ in range(last_line_count):
                         print('\033[A', end='')
                     print('\033[J', end='', flush=True)
                     last_line_count = 0
-        else:
-            # No active threads - clear previous output if any
-            if last_line_count > 0:
-                for _ in range(last_line_count):
-                    print('\033[A', end='')
-                print('\033[J', end='', flush=True)
-                last_line_count = 0
+            else:
+                # Windows: just clear the line
+                if last_line_count > 0:
+                    print('\r' + ' ' * 80 + '\r', end='', flush=True)
+                    last_line_count = 0
         
         time.sleep(0.2)  # Update 5 times per second
 
@@ -1797,14 +1848,17 @@ def extract_voting_results(html_content):
     
     The function handles various HTML structures and formats, normalizes names,
     validates percentages, removes duplicates, and sorts by percentage descending.
+    Also extracts the total number of votes cast from the page.
     
     Args:
         html_content (str): HTML content of the results page to parse
     
     Returns:
-        list: List of tuples containing (athlete_name, percentage) sorted by percentage
+        tuple: (results, total_votes) where:
+            - results: List of tuples containing (athlete_name, percentage) sorted by percentage
               in descending order. Example: [("Cutler Whitaker", 23.58), ("Dylan Papushak", 24.23)]
               Returns empty list if no results could be extracted.
+            - total_votes: Integer representing total number of votes cast, or None if not found
     """
     results = []
     try:
@@ -1954,23 +2008,55 @@ def extract_voting_results(html_content):
         # Sort by percentage descending (highest votes first)
         unique_results.sort(key=lambda x: x[1], reverse=True)
         
+        # Extract total votes count from the page
+        # Look for patterns like "Total Votes: 58,836" or "Total Votes: 58836"
+        total_votes = None
+        try:
+            # Search for "Total Votes" text in the HTML
+            body_text = soup.get_text()
+            # Pattern to match "Total Votes: 58,836" or "Total Votes: 58836" or "Total Votes 58,836"
+            total_patterns = [
+                re.compile(r'Total\s+Votes?\s*:?\s*([\d,]+)', re.IGNORECASE),
+                re.compile(r'Total\s+Votes?\s*:?\s*(\d+)', re.IGNORECASE),
+            ]
+            
+            for pattern in total_patterns:
+                match = pattern.search(body_text)
+                if match:
+                    # Extract number and remove commas
+                    total_votes_str = match.group(1).replace(',', '')
+                    try:
+                        total_votes = int(total_votes_str)
+                        break
+                    except ValueError:
+                        continue
+        except Exception as e:
+            # If we can't extract total votes, that's okay - it's optional
+            debug_print(f"Could not extract total votes: {e}")
+        
     except Exception as e:
         print(f"Error extracting results: {e}")
         import traceback
         traceback.print_exc()
+        return [], None
     
-    return unique_results
+    return unique_results, total_votes
 
-def print_top_results(results, top_n=5):
+def print_top_results(results, top_n=5, total_votes=None):
     """
     Print the top N voting results in a formatted table.
     
     Displays athlete names and their vote percentages in a clean, readable format.
     The results are already sorted by percentage descending when passed to this function.
+    Optionally displays the total number of votes cast.
+    
+    This function temporarily clears the status display to prevent it from overwriting
+    the voting results output.
     
     Args:
         results (list): List of tuples containing (athlete_name, percentage) sorted by percentage
         top_n (int): Number of top results to display (default: 5)
+        total_votes (int, optional): Total number of votes cast across all candidates
     
     Returns:
         list: The results list passed in (for chaining), or None if no results
@@ -1979,12 +2065,49 @@ def print_top_results(results, top_n=5):
         print("⚠ No results found to display")
         return None
     
+    # Temporarily pause status display and clear any active status lines before printing results
+    # This prevents the status display from overwriting the voting results
+    global _status_display_paused
+    is_windows = platform.system() == 'Windows'
+    
+    with _status_lock:
+        _status_display_paused = True  # Pause status updates
+        active_threads = list(_thread_status.keys())
+        if active_threads:
+            # Count how many status lines are currently displayed
+            status_line_count = sum(1 for tid in active_threads 
+                                  if _thread_status.get(tid, {}).get('status') == 'processing')
+            # Clear status lines (Windows-compatible)
+            if status_line_count > 0:
+                if is_windows:
+                    # Windows: just print newline to move past status lines
+                    print('\n', end='', flush=True)
+                else:
+                    # Unix-like: use ANSI escape codes
+                    for _ in range(status_line_count):
+                        print('\033[A', end='')  # Move up one line
+                    print('\033[J', end='', flush=True)  # Clear from cursor to end
+        # Small delay to ensure status display thread sees the pause flag before we print results
+        time.sleep(0.1)
+    
     print(f"\n{'='*60}")
     print(f"TOP {min(top_n, len(results))} VOTING RESULTS:")
     print(f"{'='*60}")
     for i, (name, percentage) in enumerate(results[:top_n], 1):
         print(f"{i}. {name:<40} {percentage:>6.2f}%")
+    
+    # Display total votes if available
+    if total_votes is not None:
+        # Format with commas for readability (e.g., 58,836)
+        total_votes_formatted = f"{total_votes:,}"
+        print(f"{'='*60}")
+        print(f"Total Votes: {total_votes_formatted}")
+    
     print(f"{'='*60}\n")
+    
+    # Resume status display after printing results
+    with _status_lock:
+        _status_display_paused = False
     
     return results
 
@@ -2127,10 +2250,10 @@ def perform_vote_iteration(thread_id="Main"):
             with open('vote_result.html', 'r', encoding='utf-8') as f:
                 result_html = f.read()
             
-            results = extract_voting_results(result_html)
+            results, total_votes = extract_voting_results(result_html)
             if results:
                 if thread_id == "Main":  # Only main thread prints results to avoid clutter
-                    print_top_results(results, top_n=5)
+                    print_top_results(results, top_n=5, total_votes=total_votes)
                 
                 cutler_ahead = is_cutler_ahead(results)
                 
