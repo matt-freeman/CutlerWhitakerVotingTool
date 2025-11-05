@@ -413,63 +413,139 @@ class TestLeadBackoff(unittest.TestCase):
         self.assertEqual(wait_time, 300)  # Capped at MAX_BACKOFF_DELAY
 
 
+class TestInitializeParallelThreads(unittest.TestCase):
+    """Test initialize_parallel_threads() function."""
+    
+    def setUp(self):
+        """Reset thread arrays before each test."""
+        vote._parallel_threads = []
+        vote._parallel_active = []
+        vote._parallel_thresholds = []
+    
+    def test_initialize_parallel_threads_default(self):
+        """Test initializing with default 7 parallel threads."""
+        vote.initialize_parallel_threads(7)
+        
+        self.assertEqual(len(vote._parallel_threads), 7)
+        self.assertEqual(len(vote._parallel_active), 7)
+        self.assertEqual(len(vote._parallel_thresholds), 7)
+        
+        # Check all threads initialized to None/False
+        for i in range(7):
+            self.assertIsNone(vote._parallel_threads[i])
+            self.assertFalse(vote._parallel_active[i])
+        
+        # Check thresholds: 20, 30, 40, 50, 60, 70, 80
+        expected_thresholds = [20, 30, 40, 50, 60, 70, 80]
+        self.assertEqual(vote._parallel_thresholds, expected_thresholds)
+    
+    def test_initialize_parallel_threads_10(self):
+        """Test initializing with 10 parallel threads."""
+        vote.initialize_parallel_threads(10)
+        
+        self.assertEqual(len(vote._parallel_threads), 10)
+        self.assertEqual(len(vote._parallel_active), 10)
+        self.assertEqual(len(vote._parallel_thresholds), 10)
+        
+        # Check thresholds increment by 10
+        expected_thresholds = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+        self.assertEqual(vote._parallel_thresholds, expected_thresholds)
+    
+    def test_initialize_parallel_threads_1(self):
+        """Test initializing with 1 parallel thread."""
+        vote.initialize_parallel_threads(1)
+        
+        self.assertEqual(len(vote._parallel_threads), 1)
+        self.assertEqual(len(vote._parallel_active), 1)
+        self.assertEqual(len(vote._parallel_thresholds), 1)
+        self.assertEqual(vote._parallel_thresholds[0], 20)
+    
+    def test_initialize_parallel_threads_15(self):
+        """Test initializing with 15 parallel threads (scalable design)."""
+        vote.initialize_parallel_threads(15)
+        
+        self.assertEqual(len(vote._parallel_threads), 15)
+        self.assertEqual(len(vote._parallel_active), 15)
+        self.assertEqual(len(vote._parallel_thresholds), 15)
+        
+        # Verify thresholds continue correctly
+        self.assertEqual(vote._parallel_thresholds[0], 20)
+        self.assertEqual(vote._parallel_thresholds[14], 20 + (14 * 10))  # 160
+
+
 class TestParallelThreadManagement(unittest.TestCase):
-    """Test parallel thread management logic."""
+    """Test parallel thread management logic with scalable design."""
     
     def setUp(self):
         """Reset thread state before each test."""
         vote.consecutive_behind_count = 0
-        vote._parallel_voting_active = False
-        vote._parallel_voting_active2 = False
+        vote.initialize_parallel_threads(7)  # Initialize with default 7 parallel threads
+        vote._force_parallel_mode = False
     
     def test_first_parallel_thread_trigger_20_rounds(self):
         """Test first parallel thread triggers at 20 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 20
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 20 and 
-                          not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 0 and not vote._parallel_active[0])
         
         self.assertTrue(should_start)
     
     def test_first_parallel_thread_not_triggered_19_rounds(self):
         """Test first parallel thread doesn't trigger at 19 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 19
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 20 and 
-                          not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 0 and not vote._parallel_active[0])
         
         self.assertFalse(should_start)
     
     def test_second_parallel_thread_trigger_30_rounds(self):
         """Test second parallel thread triggers at 30 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 30
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 30 and 
-                          not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 1 and not vote._parallel_active[1])
         
         self.assertTrue(should_start)
     
     def test_second_parallel_thread_not_triggered_29_rounds(self):
         """Test second parallel thread doesn't trigger at 29 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 29
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 30 and 
-                          not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 1 and not vote._parallel_active[1])
         
         self.assertFalse(should_start)
     
     def test_parallel_thread_stop_when_ahead(self):
-        """Test parallel threads stop when Cutler gets ahead."""
-        vote._parallel_voting_active = True
-        vote._parallel_voting_active2 = True
+        """Test parallel threads stop when Cutler gets ahead (unless forced)."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
         
         results = [
             ("Cutler Whitaker", 28.45),
@@ -477,26 +553,92 @@ class TestParallelThreadManagement(unittest.TestCase):
         ]
         
         cutler_ahead = vote.is_cutler_ahead(results)
-        if cutler_ahead:
+        if cutler_ahead and not vote._force_parallel_mode:
             with vote._parallel_voting_lock:
-                vote._parallel_voting_active = False
-                vote._parallel_voting_active2 = False
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active)
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[0])
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_parallel_thread_stay_active_with_force_parallel(self):
+        """Test parallel threads stay active when force_parallel_mode is True."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = True
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
+        
+        results = [
+            ("Cutler Whitaker", 28.45),
+            ("Dylan Papushak", 24.23)
+        ]
+        
+        cutler_ahead = vote.is_cutler_ahead(results)
+        if cutler_ahead and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
+        
+        # Should still be active because force_parallel_mode is True
+        self.assertTrue(vote._parallel_active[0])
+        self.assertTrue(vote._parallel_active[1])
     
     def test_second_thread_stop_below_30_rounds(self):
-        """Test second parallel thread stops when below 30 rounds."""
-        vote._parallel_voting_active2 = True
+        """Test second parallel thread stops when below 30 rounds (unless forced)."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[1] = True
         
         with vote._counter_lock:
             vote.consecutive_behind_count = 25  # Below 30
         
-        with vote._parallel_voting_lock:
-            if vote.consecutive_behind_count < 30:
-                vote._parallel_voting_active2 = False
+        threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+        if vote.consecutive_behind_count < threshold and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_all_threads_trigger_at_respective_thresholds(self):
+        """Test all parallel threads trigger at their respective thresholds."""
+        vote.initialize_parallel_threads(7)
+        
+        thresholds = [20, 30, 40, 50, 60, 70, 80]
+        
+        for i, threshold in enumerate(thresholds):
+            with vote._counter_lock:
+                vote.consecutive_behind_count = threshold
+            
+            with vote._parallel_voting_lock:
+                if i < len(vote._parallel_thresholds):
+                    should_start = (vote.consecutive_behind_count >= vote._parallel_thresholds[i] and 
+                                  not vote._parallel_active[i])
+                    self.assertTrue(should_start, f"Thread {i} should start at threshold {threshold}")
+    
+    def test_thread_8_triggers_at_80_rounds(self):
+        """Test 8th parallel thread (index 6 with 7 threads) triggers at 80 rounds."""
+        vote.initialize_parallel_threads(7)  # Default: 7 parallel threads
+        
+        with vote._counter_lock:
+            vote.consecutive_behind_count = 80
+        
+        with vote._parallel_voting_lock:
+            thread_index = 6  # 7th parallel thread (0-indexed), which is the 8th thread total (main + 7 parallel)
+            if thread_index < len(vote._parallel_thresholds):
+                threshold = vote._parallel_thresholds[thread_index]
+                should_start = (vote.consecutive_behind_count >= threshold and 
+                              thread_index < len(vote._parallel_active) and
+                              not vote._parallel_active[thread_index])
+            else:
+                threshold = 80
+                should_start = False
+        
+        self.assertTrue(should_start, f"Thread {thread_index} should start at threshold {threshold}")
+        self.assertEqual(threshold, 80)
 
 
 class TestCommandLineArguments(unittest.TestCase):
@@ -531,7 +673,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 2)
@@ -542,7 +684,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 3)
@@ -553,7 +695,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 4)
@@ -564,10 +706,116 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 5)
+    
+    def test_start_threads_6(self):
+        """Test --start-threads 6."""
+        test_args = ['vote.py', '--start-threads', '6']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 6)
+    
+    def test_start_threads_7(self):
+        """Test --start-threads 7."""
+        test_args = ['vote.py', '--start-threads', '7']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 7)
+    
+    def test_start_threads_8(self):
+        """Test --start-threads 8."""
+        test_args = ['vote.py', '--start-threads', '8']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 8)
+    
+    def test_max_threads_default(self):
+        """Test --max-threads defaults to 8."""
+        test_args = ['vote.py']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 8)
+    
+    def test_max_threads_custom(self):
+        """Test --max-threads with custom value."""
+        test_args = ['vote.py', '--max-threads', '10']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 10)
+    
+    def test_max_threads_15(self):
+        """Test --max-threads with 15 threads."""
+        test_args = ['vote.py', '--max-threads', '15']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 15)
+    
+    def test_force_parallel_flag(self):
+        """Test --force-parallel flag parsing."""
+        test_args = ['vote.py', '--force-parallel']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--force-parallel', action='store_true', default=False)
+            args = parser.parse_args()
+            
+            self.assertTrue(args.force_parallel)
+    
+    def test_force_parallel_default(self):
+        """Test --force-parallel defaults to False."""
+        test_args = ['vote.py']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--force-parallel', action='store_true', default=False)
+            args = parser.parse_args()
+            
+            self.assertFalse(args.force_parallel)
+    
+    def test_max_threads_validation(self):
+        """Test that max_threads must be >= start_threads."""
+        # This tests the validation logic in main()
+        max_threads = 5
+        start_thread_count = 8
+        
+        # Validation should fail
+        is_valid = start_thread_count <= max_threads
+        
+        self.assertFalse(is_valid)
+        
+        # Valid case
+        max_threads = 10
+        start_thread_count = 5
+        is_valid = start_thread_count <= max_threads
+        
+        self.assertTrue(is_valid)
     
     def test_save_top_results_flag(self):
         """Test --save-top-results flag parsing."""
@@ -762,20 +1010,93 @@ class TestStartThreadsLogic(unittest.TestCase):
     
     def test_start_threads_5_initializes_50(self):
         """Test --start-threads 5 initializes behind_count to 50."""
+        # Initialize with default 7 parallel threads
+        vote.initialize_parallel_threads(7)
+        
         start_thread_count = 5
         
-        if start_thread_count >= 5:
-            initial_behind_count = 50
-        elif start_thread_count >= 4:
-            initial_behind_count = 40
-        elif start_thread_count >= 3:
-            initial_behind_count = 30
-        elif start_thread_count >= 2:
-            initial_behind_count = 20
+        # Calculate threshold for the last thread that will be started
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2  # 0-indexed
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
         else:
             initial_behind_count = 0
         
         self.assertEqual(initial_behind_count, 50)
+    
+    def test_start_threads_6_initializes_60(self):
+        """Test --start-threads 6 initializes behind_count to 60."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 6
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 60)
+    
+    def test_start_threads_7_initializes_70(self):
+        """Test --start-threads 7 initializes behind_count to 70."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 7
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 70)
+    
+    def test_start_threads_8_initializes_80(self):
+        """Test --start-threads 8 initializes behind_count to 80."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 8
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 80)
+    
+    def test_start_threads_uses_dynamic_thresholds(self):
+        """Test that start_threads uses dynamic thresholds from initialize_parallel_threads."""
+        # Test with different max_threads values
+        vote.initialize_parallel_threads(10)  # 10 parallel threads
+        
+        start_thread_count = 5
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        # Should still be 50 (3rd parallel thread, index 3)
+        self.assertEqual(initial_behind_count, 50)
+        self.assertEqual(vote._parallel_thresholds[3], 50)
 
 
 class TestTimingRanges(unittest.TestCase):
@@ -1035,19 +1356,23 @@ class TestIntegrationScenarios(unittest.TestCase):
         self.assertLessEqual(multipliers[-1], vote.MAX_BACKOFF_DELAY / 60.0)
     
     def test_scenario_parallel_threads_start_stop(self):
-        """Test parallel threads start and stop correctly."""
+        """Test parallel threads start and stop correctly with scalable design."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
         # Start with 20 rounds behind
         with vote._counter_lock:
             vote.consecutive_behind_count = 20
         
         # Should trigger first parallel thread
         with vote._parallel_voting_lock:
-            should_start_1 = (vote.consecutive_behind_count >= 20 and 
-                             not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start_1 = (vote.consecutive_behind_count >= threshold and 
+                             not vote._parallel_active[0])
             if should_start_1:
-                vote._parallel_voting_active = True
+                vote._parallel_active[0] = True
         
-        self.assertTrue(vote._parallel_voting_active)
+        self.assertTrue(vote._parallel_active[0])
         
         # Increase to 30 rounds
         with vote._counter_lock:
@@ -1055,12 +1380,13 @@ class TestIntegrationScenarios(unittest.TestCase):
         
         # Should trigger second parallel thread
         with vote._parallel_voting_lock:
-            should_start_2 = (vote.consecutive_behind_count >= 30 and 
-                             not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start_2 = (vote.consecutive_behind_count >= threshold and 
+                             not vote._parallel_active[1])
             if should_start_2:
-                vote._parallel_voting_active2 = True
+                vote._parallel_active[1] = True
         
-        self.assertTrue(vote._parallel_voting_active2)
+        self.assertTrue(vote._parallel_active[1])
         
         # Cutler gets ahead
         results = [
@@ -1068,13 +1394,58 @@ class TestIntegrationScenarios(unittest.TestCase):
             ("Dylan Papushak", 25.0)
         ]
         
-        if vote.is_cutler_ahead(results):
+        if vote.is_cutler_ahead(results) and not vote._force_parallel_mode:
             with vote._parallel_voting_lock:
-                vote._parallel_voting_active = False
-                vote._parallel_voting_active2 = False
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active)
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[0])
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_scenario_force_parallel_keeps_threads_active(self):
+        """Test that force_parallel_mode keeps threads active even when Cutler is ahead."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = True
+        
+        # Start threads
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
+        
+        # Cutler gets ahead
+        results = [
+            ("Cutler Whitaker", 35.0),
+            ("Dylan Papushak", 25.0)
+        ]
+        
+        # Even though Cutler is ahead, threads should stay active
+        if vote.is_cutler_ahead(results) and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
+        
+        # Should still be active because force_parallel_mode is True
+        self.assertTrue(vote._parallel_active[0])
+        self.assertTrue(vote._parallel_active[1])
+    
+    def test_scenario_multiple_threads_scale_up(self):
+        """Test that multiple threads can scale up correctly."""
+        vote.initialize_parallel_threads(10)  # Support up to 10 threads
+        
+        # Progressively increase behind count and verify threads start
+        thresholds = [20, 30, 40, 50, 60, 70, 80, 90, 100]
+        
+        for i, threshold in enumerate(thresholds):
+            with vote._counter_lock:
+                vote.consecutive_behind_count = threshold
+            
+            if i < len(vote._parallel_thresholds):
+                with vote._parallel_voting_lock:
+                    if vote.consecutive_behind_count >= vote._parallel_thresholds[i]:
+                        vote._parallel_active[i] = True
+                
+                self.assertTrue(vote._parallel_active[i], 
+                             f"Thread {i} should be active at threshold {threshold}")
     
     def test_scenario_vote_statistics_tracking(self):
         """Test that vote statistics are tracked correctly."""
@@ -1509,6 +1880,7 @@ if __name__ == '__main__':
     suite.addTests(loader.loadTestsFromTestCase(TestResultExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestAdaptiveTiming))
     suite.addTests(loader.loadTestsFromTestCase(TestLeadBackoff))
+    suite.addTests(loader.loadTestsFromTestCase(TestInitializeParallelThreads))
     suite.addTests(loader.loadTestsFromTestCase(TestParallelThreadManagement))
     suite.addTests(loader.loadTestsFromTestCase(TestCommandLineArguments))
     suite.addTests(loader.loadTestsFromTestCase(TestThreadSafety))

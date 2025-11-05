@@ -2506,7 +2506,71 @@ def main():
                        help='Force parallel threads to stay active even when Cutler is ahead. '
                             'When enabled, parallel threads will continue running regardless of '
                             'Cutler\'s position or behind count. Useful for maximum voting speed.')
+    parser.add_argument('--check-system', action='store_true', default=False,
+                       help='Display system CPU information and thread count recommendations, then exit.')
     args = parser.parse_args()
+    
+    # Handle --check-system option
+    if args.check_system:
+        print(f"\n{'='*60}")
+        print("SYSTEM CPU INFORMATION")
+        print(f"{'='*60}\n")
+        
+        try:
+            import multiprocessing
+            # Get both physical cores and logical processors
+            # Note: multiprocessing.cpu_count(logical=False) requires Python 3.8+
+            # On older Python versions or some platforms, we'll use logical count for both
+            try:
+                physical_cores = multiprocessing.cpu_count(logical=False)  # Physical cores only (Python 3.8+)
+            except (TypeError, AttributeError):
+                # Fallback for Python < 3.8 or platforms where logical=False isn't supported
+                # In this case, we can't distinguish physical from logical, so use the total count
+                physical_cores = multiprocessing.cpu_count()
+            logical_processors = multiprocessing.cpu_count()  # Total logical processors (includes hyperthreading)
+            
+            # Calculate recommendations
+            safe_recommendation = min(logical_processors, physical_cores * 2)
+            moderate_recommendation = min(logical_processors * 1.5, physical_cores * 3)
+            aggressive_recommendation = logical_processors * 2
+            
+            print(f"Physical CPU Cores:        {physical_cores}")
+            print(f"Logical Processors:        {logical_processors}")
+            if physical_cores < logical_processors:
+                print(f"Hyperthreading:            Enabled ({logical_processors // physical_cores}x per core)")
+            else:
+                print(f"Hyperthreading:            Not detected")
+            print(f"\n{'='*60}")
+            print("RECOMMENDED THREAD COUNTS")
+            print(f"{'='*60}\n")
+            print(f"Conservative (Safe):       --max-threads {int(safe_recommendation)}")
+            print(f"   - Matches logical processors or 2x physical cores")
+            print(f"   - Best balance of performance and stability")
+            print(f"   - Recommended for most systems\n")
+            print(f"Moderate:                  --max-threads {int(moderate_recommendation)}")
+            print(f"   - 1.5x logical processors (up to 3x physical cores)")
+            print(f"   - Good for systems with 4GB+ free RAM")
+            print(f"   - May cause some CPU contention\n")
+            print(f"Aggressive (Maximum):      --max-threads {int(aggressive_recommendation)}")
+            print(f"   - 2x logical processors")
+            print(f"   - Maximum voting speed")
+            print(f"   - Requires 4GB+ free RAM and may cause system slowdown")
+            print(f"   - Each Chrome instance uses ~200-500MB RAM\n")
+            print(f"{'='*60}")
+            print("MEMORY CONSIDERATIONS")
+            print(f"{'='*60}\n")
+            print(f"Each Chrome instance typically uses 200-500MB RAM.")
+            print(f"Thread count estimates:")
+            print(f"  - {int(safe_recommendation)} threads: ~{int(safe_recommendation * 0.3)}-{int(safe_recommendation * 0.5)}GB RAM")
+            print(f"  - {int(moderate_recommendation)} threads: ~{int(moderate_recommendation * 0.3)}-{int(moderate_recommendation * 0.5)}GB RAM")
+            print(f"  - {int(aggressive_recommendation)} threads: ~{int(aggressive_recommendation * 0.3)}-{int(aggressive_recommendation * 0.5)}GB RAM")
+            print(f"\n{'='*60}\n")
+            
+        except Exception as e:
+            print(f"Error detecting CPU information: {e}")
+            print("Make sure you have Python's multiprocessing module available.\n")
+        
+        sys.exit(0)
     
     # Set debug mode based on command-line argument
     debug_mode = args.debug
@@ -2529,10 +2593,14 @@ def main():
     try:
         import multiprocessing
         # Get both physical cores and logical processors
+        # Note: multiprocessing.cpu_count(logical=False) requires Python 3.8+
+        # On older Python versions or some platforms, we'll use logical count for both
         try:
-            physical_cores = multiprocessing.cpu_count(logical=False)  # Physical cores only
-        except:
-            physical_cores = multiprocessing.cpu_count()  # Fallback if logical=False not supported
+            physical_cores = multiprocessing.cpu_count(logical=False)  # Physical cores only (Python 3.8+)
+        except (TypeError, AttributeError):
+            # Fallback for Python < 3.8 or platforms where logical=False isn't supported
+            # In this case, we can't distinguish physical from logical, so use the total count
+            physical_cores = multiprocessing.cpu_count()
         logical_processors = multiprocessing.cpu_count()  # Total logical processors (includes hyperthreading)
         
         # Calculate safe thread count recommendations

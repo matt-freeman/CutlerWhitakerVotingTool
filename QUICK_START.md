@@ -35,6 +35,46 @@ ChromeDriver is required for the script to work. Install it using Homebrew:
 brew install chromedriver
 ```
 
+**Important on macOS:** After installing, macOS Gatekeeper will need to verify ChromeDriver. Follow these steps:
+
+1. **Verify ChromeDriver and trigger the security check:**
+   ```bash
+   chromedriver --version
+   ```
+   
+   **What to expect:**
+   - First time: macOS may show a security dialog saying ChromeDriver can't be opened
+   - You'll see options like "Move to Trash", "Cancel", and possibly "Open"
+   - **Click "Open"** (you may need to enter your password)
+   - This completes the Gatekeeper verification
+
+2. **If you see a security dialog when running `chromedriver --version`:**
+   - **Option 1 (Recommended):** Click "Open" in the dialog
+     - Enter your password if prompted
+     - This permanently allows ChromeDriver to run
+   - **Option 2:** Go to System Settings → Privacy & Security
+     - Scroll down to find the message about ChromeDriver being blocked
+     - Click "Allow Anyway"
+     - Then run `chromedriver --version` again to complete verification
+
+3. **Verify it's working:**
+   ```bash
+   chromedriver --version
+   ```
+   
+   You should see a version number without any dialogs (e.g., "ChromeDriver 120.0.6099.109")
+   
+   **If you still see a dialog:**
+   - Click "Open" and enter your password
+   - This is macOS Gatekeeper's final verification step
+   - After this, ChromeDriver will work without prompts
+
+**Why this happens:**
+- macOS Gatekeeper checks if software is signed/notarized by the developer
+- ChromeDriver from Homebrew may not be fully signed, so macOS requires explicit approval
+- Running `chromedriver --version` actually executes it, which triggers the verification
+- Once you approve it, macOS remembers and won't prompt again
+
 **Note:** If you don't have Homebrew installed, install it first:
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -90,9 +130,46 @@ python3 vote.py --start-threads 8 --force-parallel
 ### "Command not found: brew"
 - Install Homebrew first (see Step 2 above)
 
-### "ChromeDriver not found"
+### "ChromeDriver not found" or script hangs
 - Make sure you installed ChromeDriver: `brew install chromedriver`
-- Verify it's installed: `chromedriver --version`
+- **Verify ChromeDriver works and complete macOS verification:**
+  ```bash
+  chromedriver --version
+  ```
+  - If you see a macOS security dialog, click "Open" and enter your password
+  - This is required for macOS Gatekeeper to verify ChromeDriver
+  - After approving, you should see a version number (e.g., "ChromeDriver 120.0.6099.109")
+  - If you still see dialogs, keep clicking "Open" until it works
+
+- **If macOS keeps showing security dialogs:**
+  - Go to System Settings → Privacy & Security
+  - Look for any messages about ChromeDriver being blocked
+  - Click "Allow Anyway" if you see it
+  - Then run `chromedriver --version` again to complete verification
+
+- **If the script hangs at "Processing Vote...":**
+  - Try running with `--no-headless` to see what's happening:
+    ```bash
+    python3 vote.py --no-headless
+    ```
+  - This will show the Chrome browser window so you can see if there are any errors
+  - Check if Chrome is actually installed and up to date:
+    ```bash
+    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --version
+    ```
+  - Make sure ChromeDriver version matches your Chrome version
+
+- **If ChromeDriver still won't run:**
+  - Try removing the quarantine attribute:
+    ```bash
+    # Apple Silicon Mac
+    xattr -d com.apple.quarantine /opt/homebrew/bin/chromedriver
+    
+    # Intel Mac
+    xattr -d com.apple.quarantine /usr/local/bin/chromedriver
+    ```
+  - Then run `chromedriver --version` again to trigger verification
+
 - If still having issues, you can manually specify the path:
   ```bash
   export CHROMEDRIVER_PATH=/opt/homebrew/bin/chromedriver
