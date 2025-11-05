@@ -214,7 +214,7 @@ def stop_status_display():
 
 def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ahead, 
                      consecutive_behind_count, vote_type, lead_percentage=None, is_backoff_vote=False, 
-                     save_top_results=False):
+                     save_top_results=False, vote_duration=None):
     """
     Log vote details to a JSON file for activity tracking.
     
@@ -250,6 +250,7 @@ def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ah
                 "vote_type": str,
                 "lead_percentage": float (or null, only if cutler_ahead),
                 "exponential_backoff": bool,
+                "vote_duration": float (or null),  # Time in seconds to complete the vote
                 "top_5_results": [  # Only included if --save-top-results flag is used
                     {"athlete": str, "percentage": float},
                     ...
@@ -273,6 +274,8 @@ def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ah
         save_top_results (bool, optional): Whether to include top_5_results in the vote entry.
             Defaults to False to keep file size down. Uses global _save_top_results flag.
             Note: This parameter is kept for compatibility but the global flag is used instead.
+        vote_duration (float, optional): Time in seconds taken to complete the vote iteration.
+            This includes the entire vote submission process from start to finish.
     
     Returns:
         None: This function only writes to file
@@ -327,7 +330,8 @@ def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ah
         "consecutive_behind_count": consecutive_behind_count,
         "vote_type": vote_type,
         "lead_percentage": round(lead_percentage, 2) if lead_percentage is not None else None,
-        "exponential_backoff": is_backoff_vote
+        "exponential_backoff": is_backoff_vote,
+        "vote_duration": round(vote_duration, 2) if vote_duration is not None else None  # Time in seconds
     }
     
     # Only include top_5_results if save_top_results is True (to keep file size down)
@@ -2085,6 +2089,9 @@ def perform_vote_iteration(thread_id="Main"):
     global vote_count, consecutive_behind_count, standard_vote_count
     global initial_accelerated_vote_count, accelerated_vote_count, super_accelerated_vote_count
     
+    # Track vote duration for performance monitoring
+    vote_iteration_start = time.time()
+    
     # Thread-safe increment of vote count
     with _counter_lock:
         vote_count += 1
@@ -2208,6 +2215,9 @@ def perform_vote_iteration(thread_id="Main"):
         # This vote was cast during a backoff period
         is_backoff_active = (current_backoff > 1.0)
     
+    # Calculate vote duration (time from start to completion)
+    vote_duration = time.time() - vote_iteration_start
+    
     # Log vote to JSON file (thread-safe)
     with _counter_lock:
         current_behind_for_log = consecutive_behind_count
@@ -2221,7 +2231,8 @@ def perform_vote_iteration(thread_id="Main"):
         consecutive_behind_count=current_behind_for_log,
         vote_type=vote_type,
         lead_percentage=lead_percentage,
-        is_backoff_vote=is_backoff_active
+        is_backoff_vote=is_backoff_active,
+        vote_duration=vote_duration
     )
     
     return success, results, cutler_ahead
