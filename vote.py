@@ -2184,6 +2184,8 @@ def signal_handler(sig, frame):
     the current vote attempt. This prevents abrupt termination and allows the
     script to display a summary of votes submitted.
     
+    Works on both Unix-like systems and Windows.
+    
     Args:
         sig: Signal number (unused, required by signal handler signature)
         frame: Current stack frame (unused, required by signal handler signature)
@@ -2191,7 +2193,8 @@ def signal_handler(sig, frame):
     global shutdown_flag
     print("\n\n⚠ Interrupt received (Ctrl+C). Gracefully shutting down...")
     shutdown_flag = True
-    sys.exit(0)
+    # Don't call sys.exit() here - let the main loop's finally block handle cleanup
+    # This ensures statistics are displayed and threads are properly shut down
 
 def perform_vote_iteration(thread_id="Main"):
     """
@@ -2521,6 +2524,50 @@ def main():
     if start_thread_count > max_threads:
         print(f"Error: --start-threads ({start_thread_count}) cannot exceed --max-threads ({max_threads})")
         sys.exit(1)
+    
+    # Detect CPU cores and provide recommendations
+    try:
+        import multiprocessing
+        # Get both physical cores and logical processors
+        try:
+            physical_cores = multiprocessing.cpu_count(logical=False)  # Physical cores only
+        except:
+            physical_cores = multiprocessing.cpu_count()  # Fallback if logical=False not supported
+        logical_processors = multiprocessing.cpu_count()  # Total logical processors (includes hyperthreading)
+        
+        # Calculate safe thread count recommendations
+        # For I/O-bound tasks with Chrome, we can use 1-2x logical processors
+        # But Chrome is resource-intensive, so be conservative
+        safe_recommendation = min(logical_processors, physical_cores * 2)  # Up to logical processors, but conservative
+        aggressive_recommendation = logical_processors * 2  # For maximum speed (I/O bound)
+        
+        if max_threads > logical_processors * 2:
+            print(f"\n⚠ WARNING: Requested {max_threads} threads.")
+            print(f"   System: {physical_cores} physical core(s), {logical_processors} logical processor(s)")
+            print(f"   This exceeds recommended thread count ({logical_processors * 2}) and may cause:")
+            print(f"   - High CPU usage and system slowdown")
+            print(f"   - Memory pressure (each Chrome instance uses ~200-500MB)")
+            print(f"   - Potential browser crashes")
+            print(f"   Recommended: --max-threads {safe_recommendation} (safe) or {aggressive_recommendation} (aggressive)\n")
+        elif max_threads > logical_processors:
+            print(f"\n⚠ WARNING: Requested {max_threads} threads exceeds logical processors ({logical_processors}).")
+            print(f"   System: {physical_cores} physical core(s), {logical_processors} logical processor(s)")
+            print(f"   This may cause performance issues. Recommended: --max-threads {safe_recommendation}\n")
+        elif max_threads <= logical_processors:
+            if physical_cores < logical_processors:
+                print(f"ℹ System: {physical_cores} physical core(s), {logical_processors} logical processor(s)")
+                print(f"   Using {max_threads} threads (within logical processor limit).")
+                if max_threads <= safe_recommendation:
+                    print(f"   ✓ Thread count is within safe limits for this system.\n")
+                else:
+                    print(f"   ⚠ Consider reducing to {safe_recommendation} threads for optimal performance.\n")
+            else:
+                print(f"ℹ System: {physical_cores} CPU core(s). Using {max_threads} threads.\n")
+    except Exception as e:
+        # Fallback if multiprocessing is unavailable
+        print("ℹ Could not detect CPU count. Using requested thread count.\n")
+        if debug_mode:
+            debug_print(f"CPU detection error: {e}")
     
     # Calculate maximum parallel threads (max_threads - 1 for main thread)
     max_parallel_threads = max_threads - 1
