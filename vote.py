@@ -74,8 +74,19 @@ _parallel_active = []  # List of active flags [bool, bool, ...]
 _parallel_thresholds = []  # List of thresholds [20, 30, 40, ...] - calculated dynamically
 _parallel_voting_lock = threading.Lock()  # Lock for parallel voting control variables
 
+# Centralized display coordinator for fixed-line output
+# All output goes through this system to maintain fixed positions
+_thread_line_map = {}  # Dictionary: thread_id -> line_number (0 = bottom thread line)
+_max_thread_lines = 0  # Maximum number of thread lines to reserve at bottom
+_results_area_start = 0  # Starting line number for results area (0 = top)
+_results_area_height = 9  # Number of lines reserved for results display (reduced to bring closer to threads)
+_display_lock = threading.Lock()  # Lock for all display operations
+_display_initialized = False  # Flag to track if display has been initialized
+_is_windows = platform.system() == 'Windows'
+_ansi_supported = False  # Will be set during initialization
+
 # Centralized status display for all threads
-_thread_status = {}  # Dictionary: thread_id -> {'status': str, 'vote_num': int, 'spinner': str}
+_thread_status = {}  # Dictionary: thread_id -> {'status': str, 'vote_num': int, 'spinner': str, 'message': str}
 _status_lock = threading.Lock()  # Lock for thread status updates
 _status_display_thread = None  # Reference to the status display thread
 _status_display_active = False  # Flag to control status display thread
@@ -101,25 +112,15 @@ _current_session_id = None  # Unique session identifier for this run
 _save_top_results = False  # Whether to save top_5_results in JSON (default: False to keep file size down)
 _force_parallel_mode = False  # Whether to force parallel threads to stay active (default: False)
 
-def status_display_manager():
-    """
-    Centralized status display thread that shows all active voting threads.
+def _init_display_coordinator():
+    """Initialize the display coordinator with ANSI support detection."""
+    global _ansi_supported, _is_windows, _display_initialized
     
-    This thread continuously updates a multi-line display showing the status
-    of all threads that are currently processing votes. Uses ANSI escape codes
-    on Unix-like systems, or Windows-compatible output on Windows.
-    """
-    global _status_display_active
-    spinner_chars = ['|', '/', '-', '\\']
-    spinner_idx = 0
-    last_line_count = 0  # Track how many lines we printed last time
-    
-    # Detect Windows and ANSI support
-    is_windows = platform.system() == 'Windows'
-    ansi_supported = False
+    _is_windows = platform.system() == 'Windows'
+    _ansi_supported = False
     
     # Try to enable ANSI support on Windows 10+ if available
-    if is_windows:
+    if _is_windows:
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -129,10 +130,77 @@ def status_display_manager():
             mode = ctypes.wintypes.DWORD()
             if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
-                ansi_supported = True
+                _ansi_supported = True
         except:
-            # If we can't enable ANSI, fall back to simple output
-            ansi_supported = False
+            _ansi_supported = False
+    
+    _display_initialized = True
+
+def _print_to_thread_line(thread_id, message):
+    """
+    Print a message to a thread's fixed line at the bottom of the screen.
+    
+    Args:
+        thread_id (str): Thread identifier (e.g., "Main", "Parallel-1")
+        message (str): Message to display on this thread's line
+    """
+    global _thread_line_map, _max_thread_lines, _ansi_supported, _is_windows
+    
+    if not _display_initialized:
+        _init_display_coordinator()
+    
+    line_pos = _thread_line_map.get(thread_id, -1)
+    if line_pos < 0 or line_pos >= _max_thread_lines:
+        # Thread not in map or invalid position - fallback to regular print
+        print(message, flush=True)
+        return
+    
+    # Calculate absolute line position from bottom (0 = bottom line)
+    # We need to move to the bottom of screen, then up to target line
+    with _display_lock:
+        if _ansi_supported or not _is_windows:
+            # Save current cursor position
+            print('\033[s', end='', flush=True)
+            
+            # Move to bottom of reserved thread area
+            # Calculate: bottom line is at (_max_thread_lines - 1) lines from top of thread area
+            # We need to go to the very bottom of the screen first
+            # Strategy: Move down to bottom, then up to target line
+            # Actually simpler: calculate from a known position
+            # Let's use: move cursor down to bottom of thread area, then up to target
+            
+            # Move down to bottom of thread area (assuming we're at top of thread area)
+            for _ in range(_max_thread_lines - 1):
+                print('\033[B', end='')  # Move down
+            
+            # Move up to target thread's line
+            lines_from_bottom = line_pos
+            for _ in range(lines_from_bottom):
+                print('\033[A', end='')  # Move up
+            
+            # Clear line and print message
+            print('\033[K', end='')  # Clear to end of line
+            print('\r' + message, end='', flush=True)
+            
+            # Restore cursor position
+            print('\033[u', end='', flush=True)
+        else:
+            # Windows without ANSI: just print (can't do fixed positioning easily)
+            print(message, flush=True)
+
+def status_display_manager():
+    """
+    Centralized status display thread that updates fixed thread lines at bottom.
+    
+    This thread continuously updates the fixed lines at the bottom of the screen,
+    one line per thread. Each thread always uses the same line.
+    """
+    global _status_display_active, _thread_line_map, _max_thread_lines
+    spinner_chars = ['|', '/', '-', '\\']
+    spinner_idx = 0
+    
+    if not _display_initialized:
+        _init_display_coordinator()
     
     while _status_display_active:
         # Check if status display is temporarily paused (e.g., during results printing)
@@ -141,115 +209,102 @@ def status_display_manager():
                 time.sleep(0.1)  # Short sleep while paused
                 continue
         
-        with _status_lock:
-            active_threads = list(_thread_status.keys())
+        # Update spinner
+        spinner_char = spinner_chars[spinner_idx % 4]
+        spinner_idx += 1
         
-        if active_threads:
-            # Update spinner for all active threads
-            spinner_char = spinner_chars[spinner_idx % 4]
-            spinner_idx += 1
+        with _status_lock:
+            # Update spinner characters and get all thread statuses
+            for thread_id in _thread_status.keys():
+                if _thread_status[thread_id]['status'] == 'processing':
+                    _thread_status[thread_id]['spinner'] = spinner_char
+        
+        # Update each thread's fixed line
+        with _status_lock:
+            all_thread_ids = list(_thread_line_map.keys())
+        
+        for thread_id in all_thread_ids:
+            status_info = _thread_status.get(thread_id, {})
+            status = status_info.get('status', 'idle')
+            vote_num = status_info.get('vote_num', 0)
+            spinner = status_info.get('spinner', '|')
+            custom_message = status_info.get('message', '')
             
-            with _status_lock:
-                # Update spinner characters
-                for thread_id in active_threads:
-                    if _thread_status[thread_id]['status'] == 'processing':
-                        _thread_status[thread_id]['spinner'] = spinner_char
-            
-            # Build status lines
-            status_lines = []
-            for thread_id in sorted(active_threads):
-                status_info = _thread_status.get(thread_id, {})
-                status = status_info.get('status', 'idle')
-                vote_num = status_info.get('vote_num', 0)
-                spinner = status_info.get('spinner', '|')
-                
-                if status == 'processing':
-                    status_lines.append(f"[{thread_id}] Processing Vote... {spinner}  (Vote #{vote_num})")
-            
-            # Display all status lines
-            if status_lines:
-                if ansi_supported or not is_windows:
-                    # Use ANSI escape codes for Unix-like systems or Windows with ANSI enabled
-                    if last_line_count > 0:
-                        # Move up by the number of lines we printed last time
-                        for _ in range(last_line_count):
-                            print('\033[A', end='')  # Move up one line
-                        print('\033[J', end='', flush=True)  # Clear from cursor to end
-                    
-                    # Print all status lines
-                    for line in status_lines:
-                        print(line, flush=True)
-                    
-                    last_line_count = len(status_lines)
-                else:
-                    # Windows without ANSI support: print each line with carriage return
-                    # This overwrites the same line for single-thread updates, or prints new lines for multi-thread
-                    if len(status_lines) == 1:
-                        # Single line: use carriage return to overwrite
-                        print(f'\r{status_lines[0]}', end='', flush=True)
-                    else:
-                        # Multiple lines: print each on new line (Windows doesn't support multi-line overwrite well)
-                        for line in status_lines:
-                            print(line, flush=True)
-                    last_line_count = len(status_lines)
+            # Build message for this thread's line
+            if custom_message:
+                # Use custom message if provided
+                message = custom_message
+            elif status == 'processing':
+                message = f"[{thread_id}] Processing Vote... {spinner}  (Vote #{vote_num})"
             else:
-                # No active threads - clear previous output if any
-                if ansi_supported or not is_windows:
-                    if last_line_count > 0:
-                        for _ in range(last_line_count):
-                            print('\033[A', end='')
-                        print('\033[J', end='', flush=True)
-                        last_line_count = 0
-                else:
-                    # Windows: just print a blank line to clear
-                    if last_line_count > 0:
-                        print('\r' + ' ' * 80 + '\r', end='', flush=True)
-                        last_line_count = 0
-        else:
-            # No active threads - clear previous output if any
-            if ansi_supported or not is_windows:
-                if last_line_count > 0:
-                    for _ in range(last_line_count):
-                        print('\033[A', end='')
-                    print('\033[J', end='', flush=True)
-                    last_line_count = 0
-            else:
-                # Windows: just clear the line
-                if last_line_count > 0:
-                    print('\r' + ' ' * 80 + '\r', end='', flush=True)
-                    last_line_count = 0
+                # Thread is idle - show blank line to maintain position
+                message = " " * 80
+            
+            # Print to this thread's fixed line
+            _print_to_thread_line(thread_id, message)
         
         time.sleep(0.2)  # Update 5 times per second
 
-def update_thread_status(thread_id, status, vote_num=0):
+def update_thread_status(thread_id, status, vote_num=0, message=None):
     """
     Update the status of a voting thread for centralized display.
     
     Args:
         thread_id (str): Identifier for the thread
-        status (str): Status string ('processing', 'completed', 'idle')
+        status (str): Status string ('processing', 'completed', 'idle', 'message')
         vote_num (int): Vote number being processed (optional)
+        message (str, optional): Custom message to display on thread's line
     """
     with _status_lock:
         if status == 'processing':
             _thread_status[thread_id] = {
                 'status': 'processing',
                 'vote_num': vote_num,
-                'spinner': '|'
+                'spinner': '|',
+                'message': message if message else ''
             }
-        elif status == 'completed':
-            # Remove from active display
+        elif status == 'message' and message:
+            # Update thread with a custom message (e.g., "Starting...", "Vote #X submitted")
             if thread_id in _thread_status:
-                del _thread_status[thread_id]
+                _thread_status[thread_id]['message'] = message
+                _thread_status[thread_id]['status'] = 'message'
+            else:
+                _thread_status[thread_id] = {
+                    'status': 'message',
+                    'vote_num': vote_num,
+                    'spinner': '|',
+                    'message': message
+                }
+        elif status == 'completed':
+            # Clear custom message, keep thread in status for a moment
+            if thread_id in _thread_status:
+                _thread_status[thread_id]['status'] = 'idle'
+                _thread_status[thread_id]['message'] = ''
         elif status == 'idle':
             if thread_id in _thread_status:
-                del _thread_status[thread_id]
+                _thread_status[thread_id]['status'] = 'idle'
+                _thread_status[thread_id]['message'] = ''
         
 
 def start_status_display():
-    """Start the centralized status display thread."""
-    global _status_display_thread, _status_display_active
+    """Start the centralized status display thread and initialize display layout."""
+    global _status_display_thread, _status_display_active, _thread_line_map, _max_thread_lines
+    
+    if not _display_initialized:
+        _init_display_coordinator()
+    
     if not _status_display_active:
+        # Reserve space at bottom for thread lines
+        # Print blank lines to create the reserved area
+        if _max_thread_lines > 0:
+            # Move cursor to bottom and reserve space
+            for _ in range(_max_thread_lines):
+                print()  # Print blank line
+            # Move cursor back up to top of reserved area
+            if _ansi_supported or not _is_windows:
+                for _ in range(_max_thread_lines):
+                    print('\033[A', end='')  # Move up
+        
         _status_display_active = True
         _status_display_thread = threading.Thread(target=status_display_manager, daemon=True)
         _status_display_thread.start()
@@ -1536,7 +1591,7 @@ def submit_vote_selenium():
                     # Strategy 2: Check if URL changed (indicates redirect to results page)
                     current_url = driver.current_url
                     if current_url != initial_url:
-                        print(f"✓ Page URL changed to: {current_url}")
+                        debug_print(f"✓ Page URL changed to: {current_url}")
                         time.sleep(2)
                         result_page_source = driver.page_source
                         found_results = True
@@ -2044,14 +2099,10 @@ def extract_voting_results(html_content):
 
 def print_top_results(results, top_n=5, total_votes=None):
     """
-    Print the top N voting results in a formatted table.
+    Print the top N voting results in a fixed area above thread lines.
     
     Displays athlete names and their vote percentages in a clean, readable format.
-    The results are already sorted by percentage descending when passed to this function.
-    Optionally displays the total number of votes cast.
-    
-    This function temporarily clears the status display to prevent it from overwriting
-    the voting results output.
+    The results are printed in a fixed area above all thread status lines.
     
     Args:
         results (list): List of tuples containing (athlete_name, percentage) sorted by percentage
@@ -2061,51 +2112,52 @@ def print_top_results(results, top_n=5, total_votes=None):
     Returns:
         list: The results list passed in (for chaining), or None if no results
     """
+    global _status_display_paused, _results_area_start, _results_area_height, _max_thread_lines
+    global _ansi_supported, _is_windows
+    
     if not results:
-        print("⚠ No results found to display")
         return None
     
-    # Temporarily pause status display and clear any active status lines before printing results
-    # This prevents the status display from overwriting the voting results
-    global _status_display_paused
-    is_windows = platform.system() == 'Windows'
+    if not _display_initialized:
+        _init_display_coordinator()
     
+    # Pause status display updates while printing results
     with _status_lock:
-        _status_display_paused = True  # Pause status updates
-        active_threads = list(_thread_status.keys())
-        if active_threads:
-            # Count how many status lines are currently displayed
-            status_line_count = sum(1 for tid in active_threads 
-                                  if _thread_status.get(tid, {}).get('status') == 'processing')
-            # Clear status lines (Windows-compatible)
-            if status_line_count > 0:
-                if is_windows:
-                    # Windows: just print newline to move past status lines
-                    print('\n', end='', flush=True)
-                else:
-                    # Unix-like: use ANSI escape codes
-                    for _ in range(status_line_count):
-                        print('\033[A', end='')  # Move up one line
-                    print('\033[J', end='', flush=True)  # Clear from cursor to end
-        # Small delay to ensure status display thread sees the pause flag before we print results
-        time.sleep(0.1)
+        _status_display_paused = True
+    time.sleep(0.1)  # Brief pause to ensure status thread sees the flag
     
-    print(f"\n{'='*60}")
-    print(f"TOP {min(top_n, len(results))} VOTING RESULTS:")
-    print(f"{'='*60}")
+    # Build results text
+    result_lines = []
+    result_lines.append("")  # Blank line to separate from startup command
+    result_lines.append(f"TOP {min(top_n, len(results))} VOTING RESULTS:")
     for i, (name, percentage) in enumerate(results[:top_n], 1):
-        print(f"{i}. {name:<40} {percentage:>6.2f}%")
+        result_lines.append(f"{i}. {name:<40} {percentage:>6.2f}%")
     
-    # Display total votes if available
     if total_votes is not None:
-        # Format with commas for readability (e.g., 58,836)
         total_votes_formatted = f"{total_votes:,}"
-        print(f"{'='*60}")
-        print(f"Total Votes: {total_votes_formatted}")
+        result_lines.append(f"Total Votes: {total_votes_formatted}")
     
-    print(f"{'='*60}\n")
+    # Print results in fixed area (top of screen)
+    with _display_lock:
+        if _ansi_supported or not _is_windows:
+            # Move to top-left corner
+            print('\033[H', end='', flush=True)
+            
+            # Clear and print each line in results area
+            for i in range(_results_area_height):
+                print('\033[K', end='', flush=True)  # Clear current line
+                if i < len(result_lines):
+                    # Print result line (with newline - this moves us to next line)
+                    print(result_lines[i], flush=True)
+                else:
+                    # Clear remaining blank lines (print newline to move down)
+                    print(flush=True)
+        else:
+            # Windows without ANSI: just print (results will appear above threads)
+            for line in result_lines:
+                print(line, flush=True)
     
-    # Resume status display after printing results
+    # Resume status display
     with _status_lock:
         _status_display_paused = False
     
@@ -2223,11 +2275,12 @@ def perform_vote_iteration(thread_id="Main"):
         vote_count += 1
         current_vote_num = vote_count
     
-    print(f"\n{'='*60}")
-    print(f"[{thread_id}] VOTE ATTEMPT #{current_vote_num} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}")
+    # Update centralized status display with vote attempt message
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    update_thread_status(thread_id, 'message', current_vote_num, 
+                        f"[{thread_id}] VOTE ATTEMPT #{current_vote_num} - {timestamp}")
     
-    # Update centralized status display
+    # Update to processing status
     update_thread_status(thread_id, 'processing', current_vote_num)
     
     # Submit vote using Selenium browser automation
@@ -2246,7 +2299,9 @@ def perform_vote_iteration(thread_id="Main"):
     lead_percentage = None
     
     if success:
-        print(f"[{thread_id}] ✓ Vote #{current_vote_num} submitted successfully!")
+        # Update thread status with success message
+        update_thread_status(thread_id, 'message', current_vote_num, 
+                            f"[{thread_id}] ✓ Vote #{current_vote_num} submitted successfully!")
         
         # Try to extract and display results
         try:
@@ -2267,7 +2322,8 @@ def perform_vote_iteration(thread_id="Main"):
                         standard_vote_count += 1
                         vote_type = "standard"
                         if thread_id == "Main":
-                            print(f"✓ {TARGET_ATHLETE} is in FIRST PLACE! Using standard interval.")
+                            update_thread_status("Main", 'message', current_vote_num, 
+                                                f"[Main] ✓ {TARGET_ATHLETE} is in FIRST PLACE! Using standard interval.")
                     else:
                         consecutive_behind_count += 1
                         current_behind = consecutive_behind_count
@@ -2275,17 +2331,20 @@ def perform_vote_iteration(thread_id="Main"):
                             super_accelerated_vote_count += 1
                             vote_type = "super_accelerated"
                             if thread_id == "Main":
-                                print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using SUPER ACCELERATED voting!")
+                                update_thread_status("Main", 'message', current_vote_num, 
+                                                    f"[Main] ⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using SUPER ACCELERATED voting!")
                         elif current_behind >= 5:
                             accelerated_vote_count += 1
                             vote_type = "accelerated"
                             if thread_id == "Main":
-                                print(f"⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using accelerated voting.")
+                                update_thread_status("Main", 'message', current_vote_num, 
+                                                    f"[Main] ⚠ {TARGET_ATHLETE} has been behind for {current_behind} consecutive rounds. Using accelerated voting.")
                         else:
                             initial_accelerated_vote_count += 1
                             vote_type = "initial_accelerated"
                             if thread_id == "Main":
-                                print(f"⚠ {TARGET_ATHLETE} is not in first place ({current_behind}/5 rounds behind). Using initial accelerated voting.")
+                                update_thread_status("Main", 'message', current_vote_num, 
+                                                    f"[Main] ⚠ {TARGET_ATHLETE} is not in first place ({current_behind}/5 rounds behind). Using initial accelerated voting.")
                 
                 # Calculate lead percentage if Cutler is ahead (for logging)
                 if cutler_ahead and results and len(results) >= 2:
@@ -2296,25 +2355,29 @@ def perform_vote_iteration(thread_id="Main"):
                 # Note: Lead percentage checking and backoff adjustment happens in main() after this function returns
             else:
                 if thread_id == "Main":
-                    print("⚠ Could not extract results from page")
+                    update_thread_status("Main", 'message', current_vote_num, 
+                                        f"[Main] ⚠ Could not extract results from page")
                 with _counter_lock:
                     standard_vote_count += 1
                     vote_type = "standard"
         except FileNotFoundError:
             if thread_id == "Main":
-                print("⚠ Result file not found, skipping result extraction")
+                update_thread_status("Main", 'message', current_vote_num, 
+                                    f"[Main] ⚠ Result file not found, skipping result extraction")
             with _counter_lock:
                 standard_vote_count += 1
                 vote_type = "standard"
         except Exception as e:
             if thread_id == "Main":
-                print(f"⚠ Error extracting results: {e}")
+                update_thread_status("Main", 'message', current_vote_num, 
+                                    f"[Main] ⚠ Error extracting results: {e}")
             with _counter_lock:
                 standard_vote_count += 1
                 vote_type = "standard"
     else:
-        if thread_id == "Main":
-            print(f"⚠ Vote #{current_vote_num} failed")
+        # Update thread status with failure message
+        update_thread_status(thread_id, 'message', current_vote_num, 
+                            f"[{thread_id}] ⚠ Vote #{current_vote_num} failed")
         # For failed votes, determine vote type based on current behind count
         with _counter_lock:
             current_behind = consecutive_behind_count
@@ -2379,13 +2442,14 @@ def parallel_voting_thread(thread_index):
     thread_name = f"Parallel-{thread_index + 1}"
     threshold = _parallel_thresholds[thread_index] if thread_index < len(_parallel_thresholds) else 20 + (thread_index * 10)
     
-    print(f"[{thread_name}] 🚀 Starting parallel voting thread to accelerate votes!")
+    # Update thread status with starting message
+    update_thread_status(thread_name, 'message', 0, f"[{thread_name}] 🚀 Starting parallel voting thread to accelerate votes!")
     
     while not shutdown_flag:
         # Check if we should continue parallel voting
         with _parallel_voting_lock:
             if thread_index < len(_parallel_active) and not _parallel_active[thread_index]:
-                print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is ahead)")
+                update_thread_status(thread_name, 'message', 0, f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is ahead)")
                 break
         
         # Check current behind count
@@ -2394,7 +2458,7 @@ def parallel_voting_thread(thread_index):
         
         # Only continue if Cutler is still behind the threshold (unless forced)
         if current_behind < threshold and not _force_parallel_mode:
-            print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler catching up - below {threshold} rounds)")
+            update_thread_status(thread_name, 'message', 0, f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler catching up - below {threshold} rounds)")
             with _parallel_voting_lock:
                 if thread_index < len(_parallel_active):
                     _parallel_active[thread_index] = False
@@ -2408,13 +2472,13 @@ def parallel_voting_thread(thread_index):
             with _parallel_voting_lock:
                 if thread_index < len(_parallel_active):
                     _parallel_active[thread_index] = False
-            print(f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is now ahead!)")
+            update_thread_status(thread_name, 'message', 0, f"[{thread_name}] ⏹ Stopping parallel voting thread (Cutler is now ahead!)")
             break
         
         # Wait 3-10 seconds before next vote (Super Accelerated interval)
         if not shutdown_flag:
             wait_time = random.randint(3, 10)
-            print(f"[{thread_name}] Waiting {wait_time} seconds before next vote (SUPER ACCELERATED)...")
+            update_thread_status(thread_name, 'message', 0, f"[{thread_name}] Waiting {wait_time} seconds before next vote (SUPER ACCELERATED)...")
             
             waited = 0
             while waited < wait_time and not shutdown_flag:
@@ -2425,7 +2489,7 @@ def parallel_voting_thread(thread_index):
                 time.sleep(1)
                 waited += 1
     
-    print(f"[{thread_name}] 🛑 Parallel voting thread stopped")
+    update_thread_status(thread_name, 'message', 0, f"[{thread_name}] 🛑 Parallel voting thread stopped")
 
 def initialize_parallel_threads(max_threads):
     """
@@ -2643,6 +2707,20 @@ def main():
     # Initialize parallel thread arrays dynamically
     initialize_parallel_threads(max_parallel_threads)
     
+    # Initialize thread line mapping for fixed display
+    # Each thread gets a fixed line at the bottom: Main = line 0, Parallel-1 = line 1, etc.
+    global _thread_line_map, _max_thread_lines
+    _thread_line_map = {}
+    _max_thread_lines = max_threads  # Reserve lines for all threads (main + parallel)
+    
+    # Map Main thread to line 0 (bottom)
+    _thread_line_map["Main"] = 0
+    
+    # Map parallel threads to lines 1, 2, 3, ... (above Main)
+    for i in range(max_parallel_threads):
+        thread_name = f"Parallel-{i+1}"
+        _thread_line_map[thread_name] = i + 1
+    
     # Set global flags
     global _save_top_results, _force_parallel_mode
     _save_top_results = args.save_top_results
@@ -2659,7 +2737,6 @@ def main():
     if _force_parallel_mode:
         print("⚠ Force parallel mode: ENABLED (threads will stay active regardless of Cutler's position)")
     print(f"Press Ctrl+C to stop\n")
-    print(f"{'='*60}")
     
     # Initialize counters for tracking voting progress
     # These counters are thread-safe using _counter_lock
@@ -2709,8 +2786,6 @@ def main():
     # If starting with multiple threads, initialize them now
     if start_thread_count > 1:
         num_parallel_threads = start_thread_count - 1  # Number of parallel threads to start
-        print(f"\n🚀 Starting with {start_thread_count} threads (main + {num_parallel_threads} parallel)")
-        print(f"   Consecutive behind count initialized to {initial_behind_count} rounds")
         with _parallel_voting_lock:
             for i in range(num_parallel_threads):
                 if i < len(_parallel_active):
@@ -2722,8 +2797,6 @@ def main():
                         daemon=True
                     )
                     _parallel_threads[i].start()
-                    print(f"   ✓ Parallel thread {i+1} started (threshold: {_parallel_thresholds[i]} rounds)")
-        print()
     
     try:
         # Main voting loop - continues until shutdown_flag is set (Ctrl+C)
@@ -2754,14 +2827,16 @@ def main():
                     if is_lead_high:
                         # Increase backoff multiplier exponentially (1.5x each time)
                         lead_backoff_multiplier = min(lead_backoff_multiplier * 1.5, MAX_BACKOFF_DELAY / 60.0)
-                        print(f"⚠ Cutler's lead ({lead_percentage:.2f}%) exceeds threshold ({lead_threshold}%). "
-                              f"Applying exponential backoff (multiplier: {lead_backoff_multiplier:.2f}x)")
+                        # Update Main thread status with backoff message
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] ⚠ Backoff active (lead: {lead_percentage:.2f}%, multiplier: {lead_backoff_multiplier:.2f}x)")
                     else:
                         # Reset backoff when lead drops below threshold
                         if lead_backoff_multiplier > 1.0:
                             lead_backoff_multiplier = 1.0
-                            print(f"✓ Cutler's lead ({lead_percentage:.2f}%) is below threshold ({lead_threshold}%). "
-                                  f"Resetting backoff to normal timing.")
+                            # Update Main thread status with backoff reset message
+                            update_thread_status("Main", 'message', vote_count, 
+                                                f"[Main] ✓ Backoff reset (lead: {lead_percentage:.2f}%)")
             
             # Check if we should start/stop parallel voting thread
             with _counter_lock:
@@ -2781,9 +2856,6 @@ def main():
                             # Count how many threads are currently active
                             active_thread_count = 1 + sum(_parallel_active)  # 1 for main + sum of parallel
                             
-                            print(f"\n🚀 Starting {thread_name}! Cutler has been behind for {current_behind_count} rounds.")
-                            print(f"   Now voting with {active_thread_count} threads at Super Accelerated speed (3-10 seconds each)")
-                            
                             # Create thread with proper closure to capture index
                             # Use default parameter to capture the value at loop iteration time
                             _parallel_threads[i] = threading.Thread(
@@ -2795,12 +2867,10 @@ def main():
                     # Stop thread if Cutler is ahead (unless forced)
                     elif cutler_ahead and _parallel_active[i] and not _force_parallel_mode:
                         _parallel_active[i] = False
-                        print(f"\n⏹ Stopping {thread_name} - {TARGET_ATHLETE} is back in the lead!")
                     
                     # Stop thread if behind count drops below threshold (unless forced)
                     elif current_behind_count < threshold and _parallel_active[i] and not _force_parallel_mode:
                         _parallel_active[i] = False
-                        print(f"\n⏹ Stopping {thread_name} - Cutler is catching up (below {threshold} rounds behind)")
             
             # Determine wait time based on Cutler's position and consecutive behind count
             # This implements the four-tier adaptive timing system with exponential backoff for high leads
@@ -2818,17 +2888,20 @@ def main():
                         # Been behind for 10+ rounds - use super accelerated speed (3-10 seconds)
                         base_wait_time = random.randint(3, 10)
                         wait_time = base_wait_time
-                        print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (SUPER ACCELERATED)...")
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] Waiting {wait_time}s before next vote (SUPER ACCELERATED, {current_behind_count} rounds behind)")
                     elif current_behind_count >= 5:
                         # Been behind for 5-9 rounds - use accelerated speed (7-16 seconds)
                         base_wait_time = random.randint(7, 16)
                         wait_time = base_wait_time
-                        print(f"\n{TARGET_ATHLETE} has been behind for {current_behind_count} rounds. Waiting {wait_time} seconds before next vote (ACCELERATED)...")
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] Waiting {wait_time}s before next vote (ACCELERATED, {current_behind_count} rounds behind)")
                     else:
                         # Recently behind (1-4 rounds) - use initial accelerated interval (14-37 seconds)
                         base_wait_time = random.randint(14, 37)
                         wait_time = base_wait_time
-                        print(f"\n{TARGET_ATHLETE} is behind ({current_behind_count}/5 rounds). Waiting {wait_time} seconds before next vote (INITIAL ACCELERATED)...")
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] Waiting {wait_time}s before next vote (INITIAL ACCELERATED, {current_behind_count} rounds behind)")
                 else:
                     # Cutler is ahead or results unavailable - use standard interval (53-67 seconds)
                     base_wait_time = random.randint(53, 67)
@@ -2836,12 +2909,12 @@ def main():
                     # Apply exponential backoff if lead is high
                     if is_lead_high and current_backoff > 1.0:
                         wait_time = min(int(base_wait_time * current_backoff), MAX_BACKOFF_DELAY)
-                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD with BACKOFF: {current_backoff:.2f}x, lead: {lead_percentage:.2f}%)...")
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] Waiting {wait_time}s before next vote (STANDARD with BACKOFF: {current_backoff:.2f}x)")
                     else:
                         wait_time = base_wait_time
-                        print(f"\nWaiting {wait_time} seconds before next vote (STANDARD)...")
-                
-                print("Press Ctrl+C to stop\n")
+                        update_thread_status("Main", 'message', vote_count, 
+                                            f"[Main] Waiting {wait_time}s before next vote (STANDARD)")
                 
                 # Wait in 1-second intervals so we can check shutdown_flag frequently
                 # This allows responsive shutdown on Ctrl+C
