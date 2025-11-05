@@ -51,6 +51,7 @@ import threading
 import uuid
 import os
 import platform
+from datetime import datetime
 
 VOTE_URL = "https://www.si.com/high-school/national/vote-who-should-be-high-school-on-si-national-boys-athlete-of-the-week-11-3-2025"
 TARGET_ATHLETE = "Cutler Whitaker"
@@ -486,18 +487,22 @@ def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ah
 
 def debug_print(*args, **kwargs):
     """
-    Print debug messages only if debug mode is enabled.
+    Print debug messages only if debug mode is enabled, with timestamps.
     
     This function acts as a conditional print statement that respects the global
     debug_mode flag. When debug mode is disabled, all debug messages are silently
-    ignored to reduce output verbosity.
+    ignored to reduce output verbosity. When enabled, messages are prefixed with
+    a timestamp in [HH:MM:SS.mmm] format.
     
     Args:
         *args: Variable positional arguments passed to print()
         **kwargs: Variable keyword arguments passed to print()
     """
     if debug_mode:
-        print(*args, **kwargs)
+        # Format timestamp as [HH:MM:SS.mmm]
+        timestamp = datetime.now().strftime('[%H:%M:%S.%f')[:-3] + ']'
+        # Combine timestamp with message
+        print(timestamp, *args, **kwargs)
 
 def get_voting_widget_info():
     """
@@ -694,6 +699,9 @@ def submit_vote_selenium():
         Requires Selenium and ChromeDriver to be installed.
         ChromeDriver must be in PATH or accessible to the system.
     """
+    vote_function_start = time.time()
+    debug_print("[PERF] Starting submit_vote_selenium()")
+    
     # Import Selenium components - required for browser automation
     try:
         from selenium import webdriver
@@ -727,11 +735,17 @@ def submit_vote_selenium():
             chromedriver_path = os.environ['CHROMEDRIVER_PATH']
             if os.path.exists(chromedriver_path):
                 debug_print(f"Using ChromeDriver from environment: {chromedriver_path}")
+                chromedriver_init_start = time.time()
                 service = Service(chromedriver_path)
                 driver = webdriver.Chrome(service=service, options=chrome_options)
+                chromedriver_init_elapsed = time.time() - chromedriver_init_start
+                debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
             else:
                 debug_print(f"Warning: CHROMEDRIVER_PATH set but file not found: {chromedriver_path}")
+                chromedriver_init_start = time.time()
                 driver = webdriver.Chrome(options=chrome_options)
+                chromedriver_init_elapsed = time.time() - chromedriver_init_start
+                debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
         else:
             # Try common locations for ChromeDriver
             # Note: We check these paths first, but if ChromeDriver is in PATH,
@@ -776,8 +790,11 @@ def submit_vote_selenium():
                             continue
                     
                     debug_print(f"Using ChromeDriver from: {path}")
+                    chromedriver_init_start = time.time()
                     service = Service(path)
                     driver = webdriver.Chrome(service=service, options=chrome_options)
+                    chromedriver_init_elapsed = time.time() - chromedriver_init_start
+                    debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
                     chromedriver_found = True
                     break
             
@@ -788,7 +805,10 @@ def submit_vote_selenium():
                 # This will fail on systems with old GLIBC, but provides a helpful error message
                 try:
                     debug_print("ChromeDriver not found in common locations, trying selenium-manager (PATH lookup)...")
+                    chromedriver_init_start = time.time()
                     driver = webdriver.Chrome(options=chrome_options)
+                    chromedriver_init_elapsed = time.time() - chromedriver_init_start
+                    debug_print(f"[PERF] ChromeDriver initialization took {chromedriver_init_elapsed:.3f} seconds")
                 except WebDriverException as e:
                     error_msg = str(e)
                     if "GLIBC" in error_msg or "selenium-manager" in error_msg.lower():
@@ -815,11 +835,28 @@ def submit_vote_selenium():
                         print("="*60 + "\n")
                     raise
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Page load timing
+        page_load_start = time.time()
+        debug_print("[PERF] Starting page load")
         driver.get(VOTE_URL)
+        debug_print("[PERF] Page load request sent")
         
         # Wait for page to fully load and JavaScript to execute
+        # Use WebDriverWait instead of fixed sleep for better performance
         debug_print("Waiting for page to load...")
-        time.sleep(5)
+        try:
+            wait = WebDriverWait(driver, 10)
+            # Wait for document ready state
+            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            debug_print("Page DOM ready")
+        except Exception as e:
+            # Fallback to shorter fixed wait if WebDriverWait fails
+            debug_print(f"[PERF] WebDriverWait failed, using fallback: {e}")
+            time.sleep(2)
+        
+        page_load_elapsed = time.time() - page_load_start
+        debug_print(f"[PERF] Page load completed in {page_load_elapsed:.2f} seconds")
         
         # Wait for React/content to be rendered
         wait = WebDriverWait(driver, 30)
@@ -827,11 +864,16 @@ def submit_vote_selenium():
         # Handle cookie consent modal/overlay that might block clicks
         # OneTrust is a common cookie consent platform used by many websites
         # These overlays can intercept clicks on voting elements, so we must dismiss them first
+        cookie_start = time.time()
+        debug_print("[PERF] Starting cookie consent handling")
         debug_print("Checking for cookie consent modal...")
         try:
             # Look for OneTrust cookie consent elements (common cookie consent platform)
+            overlay_search_start = time.time()
             cookie_overlays = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter, .onetrust-pc-sdk, #onetrust-pc-sdk")
+            overlay_search_elapsed = time.time() - overlay_search_start
             if cookie_overlays:
+                debug_print(f"[PERF] Overlay search took {overlay_search_elapsed:.3f} seconds")
                 debug_print(f"Found {len(cookie_overlays)} cookie consent overlay(s)")
             
             # Try multiple selectors to find accept/dismiss buttons
@@ -849,48 +891,93 @@ def submit_vote_selenium():
                 "#onetrust-accept-btn-handler",
             ]
             
-            for selector in accept_selectors:
+            button_found = False
+            for selector_idx, selector in enumerate(accept_selectors, 1):
+                if button_found:
+                    break
+                selector_start = time.time()
                 try:
                     accept_buttons = driver.find_elements(By.CSS_SELECTOR, selector)
+                    selector_elapsed = time.time() - selector_start
+                    debug_print(f"[PERF] Selector {selector_idx} ({selector[:50]}): {len(accept_buttons)} elements found in {selector_elapsed:.3f}s")
                     for btn in accept_buttons:
+                            btn_check_start = time.time()
                             if btn.is_displayed() and btn.is_enabled():
+                                btn_check_elapsed = time.time() - btn_check_start
+                                debug_print(f"[PERF] Button visibility check took {btn_check_elapsed:.3f}s")
                                 debug_print(f"Found cookie consent button: {selector}")
                                 # Try to click it
+                                click_start = time.time()
                                 try:
                                     btn.click()
+                                    click_elapsed = time.time() - click_start
+                                    debug_print(f"[PERF] Button click took {click_elapsed:.3f}s")
                                     debug_print("✓ Clicked cookie consent button")
-                                    time.sleep(2)
+                                    # Reduced wait time - overlay should disappear quickly
+                                    time.sleep(0.5)
+                                    button_found = True
                                     break
-                                except:
+                                except Exception as click_error:
                                     # Try JavaScript click as fallback
                                     try:
+                                        js_click_start = time.time()
                                         driver.execute_script("arguments[0].click();", btn)
+                                        js_click_elapsed = time.time() - js_click_start
+                                        debug_print(f"[PERF] JavaScript click took {js_click_elapsed:.3f}s")
                                         debug_print("✓ Clicked cookie consent button (JavaScript)")
-                                        time.sleep(2)
+                                        # Reduced wait time - overlay should disappear quickly
+                                        time.sleep(0.5)
+                                        button_found = True
                                         break
-                                    except:
+                                    except Exception as js_error:
+                                        debug_print(f"[PERF] Both click methods failed: {click_error}, {js_error}")
                                         continue
-                except:
+                except Exception as e:
+                    selector_elapsed = time.time() - selector_start
+                    debug_print(f"[PERF] Selector {selector_idx} failed after {selector_elapsed:.3f}s: {e}")
                     continue
             
             # Wait for overlay to disappear
+            overlay_wait_start = time.time()
             max_overlay_wait = 10
             overlay_wait = 0
             while overlay_wait < max_overlay_wait:
                 try:
+                    check_start = time.time()
                     overlays = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
                     visible_overlays = [o for o in overlays if o.is_displayed()]
+                    check_elapsed = time.time() - check_start
                     if not visible_overlays:
+                        overlay_wait_elapsed = time.time() - overlay_wait_start
+                        debug_print(f"[PERF] Overlay dismissal check took {check_elapsed:.3f}s (total wait: {overlay_wait_elapsed:.2f}s)")
                         debug_print("✓ Cookie consent overlay dismissed")
                         break
                     time.sleep(0.5)
                     overlay_wait += 0.5
-                except:
+                except Exception as e:
+                    debug_print(f"[PERF] Error checking overlay: {e}")
                     break
             
-            # Additional wait for any animations
-            time.sleep(1)
+            # Reduced wait for animations - check if overlay is gone instead of fixed wait
+            animation_wait_start = time.time()
+            # Quick check - if overlay is already gone, don't wait
+            try:
+                overlays_check = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
+                visible_check = [o for o in overlays_check if o.is_displayed()]
+                if visible_check:
+                    time.sleep(0.5)  # Only wait if overlay still visible
+                else:
+                    debug_print("[PERF] Overlay already gone, skipping animation wait")
+            except:
+                time.sleep(0.3)  # Minimal fallback wait
+            animation_wait_elapsed = time.time() - animation_wait_start
+            debug_print(f"[PERF] Animation wait: {animation_wait_elapsed:.3f}s")
+            
+            cookie_elapsed = time.time() - cookie_start
+            debug_print(f"[PERF] Cookie consent handling completed in {cookie_elapsed:.2f} seconds")
         except Exception as e:
+            cookie_elapsed = time.time() - cookie_start
+            debug_print(f"[PERF] Cookie consent handling failed after {cookie_elapsed:.2f}s")
             print(f"Note: Could not handle cookie consent: {e}")
             # Continue anyway - might not be an issue
         
@@ -898,34 +985,53 @@ def submit_vote_selenium():
         # Many polling widgets are embedded in iframes, so we need to check and potentially
         # switch context to interact with elements inside the iframe
         # We'll check all iframes since the voting widget might be in any of them
+        iframe_start = time.time()
+        debug_print("[PERF] Starting iframe detection")
         in_iframe = False  # Track if we've switched to an iframe context
         active_iframe = None  # Store reference to the iframe we're currently in
         all_iframes = []  # Store all iframes for later checking
         try:
+            iframe_search_start = time.time()
             iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            iframe_search_elapsed = time.time() - iframe_search_start
+            debug_print(f"[PERF] Iframe search took {iframe_search_elapsed:.3f} seconds")
             debug_print(f"Found {len(iframes)} iframes on page")
-            for iframe in iframes:
+            for iframe_idx, iframe in enumerate(iframes, 1):
                 try:
+                    attr_start = time.time()
                     src = iframe.get_attribute('src')
                     iframe_id = iframe.get_attribute('id') or 'no-id'
+                    attr_elapsed = time.time() - attr_start
                     all_iframes.append((iframe, src, iframe_id))
                     if src and ('poll' in src.lower() or 'vote' in src.lower() or 'survey' in src.lower() or 'widget' in src.lower()):
+                        debug_print(f"[PERF] Iframe {iframe_idx} attribute check took {attr_elapsed:.3f}s")
                         debug_print(f"Found potential voting iframe: {src}")
+                        switch_start = time.time()
                         driver.switch_to.frame(iframe)
+                        switch_elapsed = time.time() - switch_start
+                        debug_print(f"[PERF] Frame switch took {switch_elapsed:.3f}s")
                         in_iframe = True
                         active_iframe = iframe
                         time.sleep(2)
                         # Now search within the iframe
                         break
+                    else:
+                        debug_print(f"[PERF] Iframe {iframe_idx} check took {attr_elapsed:.3f}s (not a voting iframe)")
                 except Exception as e:
-                    debug_print(f"Error checking iframe: {e}")
+                    debug_print(f"[PERF] Error checking iframe {iframe_idx}: {e}")
                     continue
+            iframe_elapsed = time.time() - iframe_start
+            debug_print(f"[PERF] Iframe detection completed in {iframe_elapsed:.2f} seconds")
         except Exception as e:
+            iframe_elapsed = time.time() - iframe_start
+            debug_print(f"[PERF] Iframe detection failed after {iframe_elapsed:.2f}s")
             debug_print(f"Error finding iframes: {e}")
         
         # Try multiple strategies to find the vote button for Cutler Whitaker
         # We use multiple strategies because different sites structure their polls differently
         # If one strategy fails, we try the next one until we find the element
+        vote_search_start = time.time()
+        debug_print("[PERF] Starting vote button search")
         vote_button = None
         strategies = [
             # Strategy 1: Find button containing athlete name (most specific)
@@ -944,42 +1050,54 @@ def submit_vote_selenium():
         
         debug_print("Searching for voting elements...")
         for strategy_idx, (strategy_type, selector) in enumerate(strategies, 1):
+            strategy_start = time.time()
             try:
                 if strategy_type == By.TAG_NAME:
                     # Special handling for finding all buttons - filter more carefully
                     buttons = driver.find_elements(By.TAG_NAME, "button")
-                    debug_print(f"Strategy {strategy_idx}: Found {len(buttons)} buttons on page")
-                    for btn in buttons:
+                    strategy_elapsed = time.time() - strategy_start
+                    debug_print(f"[PERF] Strategy {strategy_idx} (TAG_NAME): Found {len(buttons)} buttons in {strategy_elapsed:.3f}s")
+                    for btn_idx, btn in enumerate(buttons, 1):
                         try:
+                            btn_check_start = time.time()
                             # Skip menu/navigation buttons
                             btn_id = btn.get_attribute('id') or ''
                             btn_class = btn.get_attribute('class') or ''
                             btn_aria = btn.get_attribute('aria-label') or ''
+                            btn_check_elapsed = time.time() - btn_check_start
                             
                             # Skip obvious non-vote buttons
                             if any(skip in btn_id.lower() or skip in btn_class.lower() or skip in btn_aria.lower() 
                                    for skip in ['menu', 'nav', 'hamburger', 'close', 'more', 'dropdown']):
+                                if btn_idx <= 5:  # Only log first few for performance
+                                    debug_print(f"[PERF] Button {btn_idx} check took {btn_check_elapsed:.3f}s (skipped)")
                                 continue
                             
                             text = btn.text.lower()
                             # Must contain vote-related text OR be near athlete name
                             if ('vote' in text or 'submit' in text) and ('cutler' in text or 'whitaker' in text):
+                                debug_print(f"[PERF] Button {btn_idx} check took {btn_check_elapsed:.3f}s")
                                 debug_print(f"Found potential vote button: text='{btn.text[:50]}', id='{btn_id}', class='{btn_class[:50]}'")
                                 vote_button = btn
                                 break
-                        except:
+                        except Exception as e:
+                            debug_print(f"[PERF] Button {btn_idx} check failed: {e}")
                             continue
                     if vote_button:
                         break
                 else:
                     elements = driver.find_elements(strategy_type, selector)
-                    debug_print(f"Strategy {strategy_idx}: Found {len(elements)} elements")
+                    strategy_elapsed = time.time() - strategy_start
+                    debug_print(f"[PERF] Strategy {strategy_idx} ({strategy_type}): Found {len(elements)} elements in {strategy_elapsed:.3f}s")
                     if elements:
-                        for elem in elements:
+                        for elem_idx, elem in enumerate(elements, 1):
                             try:
+                                elem_check_start = time.time()
                                 if elem.is_displayed() and elem.is_enabled():
+                                    elem_check_elapsed = time.time() - elem_check_start
                                     elem_text = elem.text[:50] if elem.text else 'N/A'
                                     elem_tag = elem.tag_name
+                                    debug_print(f"[PERF] Element {elem_idx} check took {elem_check_elapsed:.3f}s")
                                     debug_print(f"Found clickable element: {elem_tag}, text='{elem_text}'")
                                     # For buttons, make sure it's not a menu button
                                     if elem_tag == 'button':
@@ -991,13 +1109,18 @@ def submit_vote_selenium():
                                             continue
                                     vote_button = elem
                                     break
-                            except:
+                            except Exception as e:
+                                debug_print(f"[PERF] Element {elem_idx} check failed: {e}")
                                 continue
                         if vote_button:
                             break
             except Exception as e:
-                print(f"Strategy {strategy_idx} failed: {e}")
+                strategy_elapsed = time.time() - strategy_start
+                debug_print(f"[PERF] Strategy {strategy_idx} failed after {strategy_elapsed:.3f}s: {e}")
                 continue
+        
+        vote_search_elapsed = time.time() - vote_search_start
+        debug_print(f"[PERF] Vote button search completed in {vote_search_elapsed:.2f} seconds")
         
         if not vote_button:
             # Last resort: Save page source and try to find by inspecting DOM
@@ -1023,19 +1146,30 @@ def submit_vote_selenium():
         
         if vote_button:
             try:
+                # Element interaction timing
+                element_interaction_start = time.time()
+                debug_print("[PERF] Starting element interaction")
+                
                 # Scroll into view
-                driver.execute_script("arguments[0].scrollIntoView(true);", vote_button)
-                time.sleep(1)
+                scroll_start = time.time()
+                driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", vote_button)
+                scroll_elapsed = time.time() - scroll_start
+                debug_print(f"[PERF] Scroll into view took {scroll_elapsed:.3f}s")
+                # Reduced wait - scroll should be instant
+                time.sleep(0.2)
                 
                 # Make sure no overlays are blocking
+                overlay_check_start = time.time()
                 try:
                     overlays = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
                     visible_overlays = [o for o in overlays if o.is_displayed()]
                     if visible_overlays:
                         print("⚠ Cookie consent overlay still visible, trying to dismiss...")
                         # Try to click outside the overlay or press ESC
-                        driver.execute_script("document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.style.display='none');")
-                        time.sleep(1)
+                        driver.execute_script("document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());")
+                        time.sleep(0.3)
+                    overlay_check_elapsed = time.time() - overlay_check_start
+                    debug_print(f"[PERF] Overlay check took {overlay_check_elapsed:.3f}s")
                 except:
                     pass
                 
@@ -1057,11 +1191,15 @@ def submit_vote_selenium():
                 # Handle two-step voting process: select radio button, then click submit
                 # Many polls use radio buttons for selection and a separate "Vote" button to submit
                 if btn_tag == 'input' and vote_button.get_attribute('type') in ['radio', 'checkbox']:
+                    radio_selection_start = time.time()
                     debug_print(f"\n✓ This is a radio/checkbox button. Selecting it first...")
                     # Step 1: Select the radio button for Cutler Whitaker
                     try:
+                        radio_click_start = time.time()
                         if not vote_button.is_selected():
                             vote_button.click()
+                            radio_click_elapsed = time.time() - radio_click_start
+                            debug_print(f"[PERF] Radio button click took {radio_click_elapsed:.3f}s")
                             debug_print(f"✓ Selected radio button for {TARGET_ATHLETE}")
                         else:
                             debug_print(f"✓ Radio button already selected")
@@ -1072,32 +1210,53 @@ def submit_vote_selenium():
                                 document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());
                                 document.querySelectorAll('#onetrust-pc-sdk').forEach(el => el.remove());
                             """)
-                            time.sleep(1)
+                            time.sleep(0.3)
+                            js_click_start = time.time()
                             driver.execute_script("arguments[0].click();", vote_button)
+                            js_click_elapsed = time.time() - js_click_start
+                            debug_print(f"[PERF] JavaScript radio click took {js_click_elapsed:.3f}s")
                             debug_print(f"✓ Selected radio button (JavaScript click)")
                         else:
                             raise click_error
                     
-                    time.sleep(1)  # Brief wait for selection to register in the DOM
+                    # Reduced wait - radio selection should register immediately
+                    time.sleep(0.3)
+                    radio_selection_elapsed = time.time() - radio_selection_start
+                    debug_print(f"[PERF] Radio button selection completed in {radio_selection_elapsed:.3f}s")
                     
                     # Step 2: Find and click the Vote/Submit button
+                    submit_search_start = time.time()
                     debug_print(f"\nLooking for Vote/Submit button...")
                     submit_button = None
-                    submit_selectors = [
-                        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'vote')]",
-                        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
-                        "//input[@type='submit' and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'vote')]",
-                        "//input[@type='submit']",
-                        "//button[@type='submit']",
-                        "//button[contains(@class, 'vote')]",
-                        "//button[contains(@class, 'submit')]",
-                        "//button[contains(@id, 'vote')]",
-                        "//button[contains(@id, 'submit')]",
+                    # Use faster CSS selectors first, then fallback to XPath
+                    submit_selectors_css = [
+                        ("css", "button[type='submit']"),
+                        ("css", "button.css-vote-button"),
+                        ("css", "button.pds-vote-button"),
+                        ("css", "button[id*='vote']"),
+                        ("css", "button[id*='Vote']"),
+                        ("css", "button[class*='vote']"),
+                        ("css", "input[type='submit']"),
+                    ]
+                    submit_selectors_xpath = [
+                        ("xpath", "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'vote')]"),
+                        ("xpath", "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]"),
+                        ("xpath", "//input[@type='submit']"),
+                        ("xpath", "//button[@type='submit']"),
+                        ("xpath", "//button[contains(@class, 'vote')]"),
+                        ("xpath", "//button[contains(@id, 'vote')]"),
                     ]
                     
-                    for selector in submit_selectors:
+                    # Try CSS selectors first (faster)
+                    for selector_type, selector in submit_selectors_css:
+                        selector_start = time.time()
                         try:
-                            buttons = driver.find_elements(By.XPATH, selector)
+                            if selector_type == "css":
+                                buttons = driver.find_elements(By.CSS_SELECTOR, selector)
+                            else:
+                                buttons = driver.find_elements(By.XPATH, selector)
+                            selector_elapsed = time.time() - selector_start
+                            debug_print(f"[PERF] Submit selector ({selector_type}): {len(buttons)} found in {selector_elapsed:.3f}s")
                             for btn in buttons:
                                 try:
                                     if btn.is_displayed() and btn.is_enabled():
@@ -1109,8 +1268,37 @@ def submit_vote_selenium():
                                     continue
                             if submit_button:
                                 break
-                        except:
+                        except Exception as e:
+                            selector_elapsed = time.time() - selector_start
+                            debug_print(f"[PERF] Submit selector ({selector_type}) failed after {selector_elapsed:.3f}s: {e}")
                             continue
+                    
+                    # Fallback to XPath if CSS didn't work
+                    if not submit_button:
+                        for selector_type, selector in submit_selectors_xpath:
+                            selector_start = time.time()
+                            try:
+                                buttons = driver.find_elements(By.XPATH, selector)
+                                selector_elapsed = time.time() - selector_start
+                                debug_print(f"[PERF] Submit selector ({selector_type}): {len(buttons)} found in {selector_elapsed:.3f}s")
+                                for btn in buttons:
+                                    try:
+                                        if btn.is_displayed() and btn.is_enabled():
+                                            btn_text_val = btn.text or btn.get_attribute('value') or ''
+                                            debug_print(f"  Found submit button: {btn.tag_name}, text='{btn_text_val[:50]}'")
+                                            submit_button = btn
+                                            break
+                                    except:
+                                        continue
+                                if submit_button:
+                                    break
+                            except Exception as e:
+                                selector_elapsed = time.time() - selector_start
+                                debug_print(f"[PERF] Submit selector ({selector_type}) failed after {selector_elapsed:.3f}s: {e}")
+                                continue
+                    
+                    submit_search_elapsed = time.time() - submit_search_start
+                    debug_print(f"[PERF] Submit button search completed in {submit_search_elapsed:.3f}s")
                     
                     if not submit_button:
                         # Try to find any button near the radio button
@@ -1141,6 +1329,7 @@ def submit_vote_selenium():
                             debug_print(f"⚠ Could not submit form. Results may not appear.")
                 
                 # Now click the vote/submit button
+                vote_click_start = time.time()
                 debug_print(f"\nClicking vote/submit button...")
                 btn_tag = vote_button.tag_name
                 btn_text = vote_button.text[:100] if vote_button.text else vote_button.get_attribute('value') or 'N/A'
@@ -1154,6 +1343,8 @@ def submit_vote_selenium():
                 # Try to click - if intercepted, use JavaScript click
                 try:
                     vote_button.click()
+                    vote_click_elapsed = time.time() - vote_click_start
+                    debug_print(f"[PERF] Vote button click took {vote_click_elapsed:.3f}s")
                     debug_print(f"✓ Successfully clicked vote button (regular click)")
                 except Exception as click_error:
                     if "click intercepted" in str(click_error).lower():
@@ -1163,12 +1354,18 @@ def submit_vote_selenium():
                             document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());
                             document.querySelectorAll('#onetrust-pc-sdk').forEach(el => el.remove());
                         """)
-                        time.sleep(1)
+                        time.sleep(0.3)
                         # Try JavaScript click
+                        js_click_start = time.time()
                         driver.execute_script("arguments[0].click();", vote_button)
+                        js_click_elapsed = time.time() - js_click_start
+                        debug_print(f"[PERF] JavaScript vote click took {js_click_elapsed:.3f}s")
                         debug_print(f"✓ Successfully clicked vote button (JavaScript click)")
                     else:
                         raise click_error
+                
+                element_interaction_elapsed = time.time() - element_interaction_start
+                debug_print(f"[PERF] Element interaction completed in {element_interaction_elapsed:.3f}s")
                 
                 debug_print("Waiting for vote to be processed...")
                 
@@ -1329,6 +1526,8 @@ def submit_vote_selenium():
                     debug_print("✓ Vote appears to have been submitted successfully!")
                 
                 driver.quit()
+                vote_function_elapsed = time.time() - vote_function_start
+                debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
                 return True
             except Exception as e:
                 print(f"Error clicking button: {e}")
@@ -1439,6 +1638,8 @@ def submit_vote_selenium():
                         debug_print("✓ Vote appears to have been submitted successfully!")
                     
                     driver.quit()
+                    vote_function_elapsed = time.time() - vote_function_start
+                    debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds")
                     return True
                 except Exception as e2:
                     print(f"JavaScript click also failed: {e2}")
@@ -1454,9 +1655,13 @@ def submit_vote_selenium():
                 pass
         
         driver.quit()
+        vote_function_elapsed = time.time() - vote_function_start
+        debug_print(f"[PERF] submit_vote_selenium() completed in {vote_function_elapsed:.2f} seconds (failed)")
         return False
             
     except Exception as e:
+        vote_function_elapsed = time.time() - vote_function_start
+        debug_print(f"[PERF] submit_vote_selenium() failed after {vote_function_elapsed:.2f} seconds")
         print(f"Selenium error: {e}")
         import traceback
         traceback.print_exc()
