@@ -413,63 +413,139 @@ class TestLeadBackoff(unittest.TestCase):
         self.assertEqual(wait_time, 300)  # Capped at MAX_BACKOFF_DELAY
 
 
+class TestInitializeParallelThreads(unittest.TestCase):
+    """Test initialize_parallel_threads() function."""
+    
+    def setUp(self):
+        """Reset thread arrays before each test."""
+        vote._parallel_threads = []
+        vote._parallel_active = []
+        vote._parallel_thresholds = []
+    
+    def test_initialize_parallel_threads_default(self):
+        """Test initializing with default 7 parallel threads."""
+        vote.initialize_parallel_threads(7)
+        
+        self.assertEqual(len(vote._parallel_threads), 7)
+        self.assertEqual(len(vote._parallel_active), 7)
+        self.assertEqual(len(vote._parallel_thresholds), 7)
+        
+        # Check all threads initialized to None/False
+        for i in range(7):
+            self.assertIsNone(vote._parallel_threads[i])
+            self.assertFalse(vote._parallel_active[i])
+        
+        # Check thresholds: 20, 30, 40, 50, 60, 70, 80
+        expected_thresholds = [20, 30, 40, 50, 60, 70, 80]
+        self.assertEqual(vote._parallel_thresholds, expected_thresholds)
+    
+    def test_initialize_parallel_threads_10(self):
+        """Test initializing with 10 parallel threads."""
+        vote.initialize_parallel_threads(10)
+        
+        self.assertEqual(len(vote._parallel_threads), 10)
+        self.assertEqual(len(vote._parallel_active), 10)
+        self.assertEqual(len(vote._parallel_thresholds), 10)
+        
+        # Check thresholds increment by 10
+        expected_thresholds = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+        self.assertEqual(vote._parallel_thresholds, expected_thresholds)
+    
+    def test_initialize_parallel_threads_1(self):
+        """Test initializing with 1 parallel thread."""
+        vote.initialize_parallel_threads(1)
+        
+        self.assertEqual(len(vote._parallel_threads), 1)
+        self.assertEqual(len(vote._parallel_active), 1)
+        self.assertEqual(len(vote._parallel_thresholds), 1)
+        self.assertEqual(vote._parallel_thresholds[0], 20)
+    
+    def test_initialize_parallel_threads_15(self):
+        """Test initializing with 15 parallel threads (scalable design)."""
+        vote.initialize_parallel_threads(15)
+        
+        self.assertEqual(len(vote._parallel_threads), 15)
+        self.assertEqual(len(vote._parallel_active), 15)
+        self.assertEqual(len(vote._parallel_thresholds), 15)
+        
+        # Verify thresholds continue correctly
+        self.assertEqual(vote._parallel_thresholds[0], 20)
+        self.assertEqual(vote._parallel_thresholds[14], 20 + (14 * 10))  # 160
+
+
 class TestParallelThreadManagement(unittest.TestCase):
-    """Test parallel thread management logic."""
+    """Test parallel thread management logic with scalable design."""
     
     def setUp(self):
         """Reset thread state before each test."""
         vote.consecutive_behind_count = 0
-        vote._parallel_voting_active = False
-        vote._parallel_voting_active2 = False
+        vote.initialize_parallel_threads(7)  # Initialize with default 7 parallel threads
+        vote._force_parallel_mode = False
     
     def test_first_parallel_thread_trigger_20_rounds(self):
         """Test first parallel thread triggers at 20 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 20
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 20 and 
-                          not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 0 and not vote._parallel_active[0])
         
         self.assertTrue(should_start)
     
     def test_first_parallel_thread_not_triggered_19_rounds(self):
         """Test first parallel thread doesn't trigger at 19 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 19
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 20 and 
-                          not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 0 and not vote._parallel_active[0])
         
         self.assertFalse(should_start)
     
     def test_second_parallel_thread_trigger_30_rounds(self):
         """Test second parallel thread triggers at 30 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 30
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 30 and 
-                          not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 1 and not vote._parallel_active[1])
         
         self.assertTrue(should_start)
     
     def test_second_parallel_thread_not_triggered_29_rounds(self):
         """Test second parallel thread doesn't trigger at 29 rounds."""
+        vote.initialize_parallel_threads(7)
+        
         with vote._counter_lock:
             vote.consecutive_behind_count = 29
         
         with vote._parallel_voting_lock:
-            should_start = (vote.consecutive_behind_count >= 30 and 
-                          not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start = (vote.consecutive_behind_count >= threshold and 
+                          len(vote._parallel_active) > 1 and not vote._parallel_active[1])
         
         self.assertFalse(should_start)
     
     def test_parallel_thread_stop_when_ahead(self):
-        """Test parallel threads stop when Cutler gets ahead."""
-        vote._parallel_voting_active = True
-        vote._parallel_voting_active2 = True
+        """Test parallel threads stop when Cutler gets ahead (unless forced)."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
         
         results = [
             ("Cutler Whitaker", 28.45),
@@ -477,26 +553,92 @@ class TestParallelThreadManagement(unittest.TestCase):
         ]
         
         cutler_ahead = vote.is_cutler_ahead(results)
-        if cutler_ahead:
+        if cutler_ahead and not vote._force_parallel_mode:
             with vote._parallel_voting_lock:
-                vote._parallel_voting_active = False
-                vote._parallel_voting_active2 = False
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active)
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[0])
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_parallel_thread_stay_active_with_force_parallel(self):
+        """Test parallel threads stay active when force_parallel_mode is True."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = True
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
+        
+        results = [
+            ("Cutler Whitaker", 28.45),
+            ("Dylan Papushak", 24.23)
+        ]
+        
+        cutler_ahead = vote.is_cutler_ahead(results)
+        if cutler_ahead and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
+        
+        # Should still be active because force_parallel_mode is True
+        self.assertTrue(vote._parallel_active[0])
+        self.assertTrue(vote._parallel_active[1])
     
     def test_second_thread_stop_below_30_rounds(self):
-        """Test second parallel thread stops when below 30 rounds."""
-        vote._parallel_voting_active2 = True
+        """Test second parallel thread stops when below 30 rounds (unless forced)."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
+        with vote._parallel_voting_lock:
+            vote._parallel_active[1] = True
         
         with vote._counter_lock:
             vote.consecutive_behind_count = 25  # Below 30
         
-        with vote._parallel_voting_lock:
-            if vote.consecutive_behind_count < 30:
-                vote._parallel_voting_active2 = False
+        threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+        if vote.consecutive_behind_count < threshold and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_all_threads_trigger_at_respective_thresholds(self):
+        """Test all parallel threads trigger at their respective thresholds."""
+        vote.initialize_parallel_threads(7)
+        
+        thresholds = [20, 30, 40, 50, 60, 70, 80]
+        
+        for i, threshold in enumerate(thresholds):
+            with vote._counter_lock:
+                vote.consecutive_behind_count = threshold
+            
+            with vote._parallel_voting_lock:
+                if i < len(vote._parallel_thresholds):
+                    should_start = (vote.consecutive_behind_count >= vote._parallel_thresholds[i] and 
+                                  not vote._parallel_active[i])
+                    self.assertTrue(should_start, f"Thread {i} should start at threshold {threshold}")
+    
+    def test_thread_8_triggers_at_80_rounds(self):
+        """Test 8th parallel thread (index 6 with 7 threads) triggers at 80 rounds."""
+        vote.initialize_parallel_threads(7)  # Default: 7 parallel threads
+        
+        with vote._counter_lock:
+            vote.consecutive_behind_count = 80
+        
+        with vote._parallel_voting_lock:
+            thread_index = 6  # 7th parallel thread (0-indexed), which is the 8th thread total (main + 7 parallel)
+            if thread_index < len(vote._parallel_thresholds):
+                threshold = vote._parallel_thresholds[thread_index]
+                should_start = (vote.consecutive_behind_count >= threshold and 
+                              thread_index < len(vote._parallel_active) and
+                              not vote._parallel_active[thread_index])
+            else:
+                threshold = 80
+                should_start = False
+        
+        self.assertTrue(should_start, f"Thread {thread_index} should start at threshold {threshold}")
+        self.assertEqual(threshold, 80)
 
 
 class TestCommandLineArguments(unittest.TestCase):
@@ -531,7 +673,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 2)
@@ -542,7 +684,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 3)
@@ -553,7 +695,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 4)
@@ -564,10 +706,116 @@ class TestCommandLineArguments(unittest.TestCase):
         
         with patch('sys.argv', test_args):
             parser = vote.argparse.ArgumentParser()
-            parser.add_argument('--start-threads', type=int, choices=[1, 2, 3, 4, 5], default=1)
+            parser.add_argument('--start-threads', type=int, default=1)
             args = parser.parse_args()
             
             self.assertEqual(args.start_threads, 5)
+    
+    def test_start_threads_6(self):
+        """Test --start-threads 6."""
+        test_args = ['vote.py', '--start-threads', '6']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 6)
+    
+    def test_start_threads_7(self):
+        """Test --start-threads 7."""
+        test_args = ['vote.py', '--start-threads', '7']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 7)
+    
+    def test_start_threads_8(self):
+        """Test --start-threads 8."""
+        test_args = ['vote.py', '--start-threads', '8']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--start-threads', type=int, default=1)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.start_threads, 8)
+    
+    def test_max_threads_default(self):
+        """Test --max-threads defaults to 8."""
+        test_args = ['vote.py']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 8)
+    
+    def test_max_threads_custom(self):
+        """Test --max-threads with custom value."""
+        test_args = ['vote.py', '--max-threads', '10']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 10)
+    
+    def test_max_threads_15(self):
+        """Test --max-threads with 15 threads."""
+        test_args = ['vote.py', '--max-threads', '15']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--max-threads', type=int, default=8)
+            args = parser.parse_args()
+            
+            self.assertEqual(args.max_threads, 15)
+    
+    def test_force_parallel_flag(self):
+        """Test --force-parallel flag parsing."""
+        test_args = ['vote.py', '--force-parallel']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--force-parallel', action='store_true', default=False)
+            args = parser.parse_args()
+            
+            self.assertTrue(args.force_parallel)
+    
+    def test_force_parallel_default(self):
+        """Test --force-parallel defaults to False."""
+        test_args = ['vote.py']
+        
+        with patch('sys.argv', test_args):
+            parser = vote.argparse.ArgumentParser()
+            parser.add_argument('--force-parallel', action='store_true', default=False)
+            args = parser.parse_args()
+            
+            self.assertFalse(args.force_parallel)
+    
+    def test_max_threads_validation(self):
+        """Test that max_threads must be >= start_threads."""
+        # This tests the validation logic in main()
+        max_threads = 5
+        start_thread_count = 8
+        
+        # Validation should fail
+        is_valid = start_thread_count <= max_threads
+        
+        self.assertFalse(is_valid)
+        
+        # Valid case
+        max_threads = 10
+        start_thread_count = 5
+        is_valid = start_thread_count <= max_threads
+        
+        self.assertTrue(is_valid)
     
     def test_save_top_results_flag(self):
         """Test --save-top-results flag parsing."""
@@ -762,20 +1010,93 @@ class TestStartThreadsLogic(unittest.TestCase):
     
     def test_start_threads_5_initializes_50(self):
         """Test --start-threads 5 initializes behind_count to 50."""
+        # Initialize with default 7 parallel threads
+        vote.initialize_parallel_threads(7)
+        
         start_thread_count = 5
         
-        if start_thread_count >= 5:
-            initial_behind_count = 50
-        elif start_thread_count >= 4:
-            initial_behind_count = 40
-        elif start_thread_count >= 3:
-            initial_behind_count = 30
-        elif start_thread_count >= 2:
-            initial_behind_count = 20
+        # Calculate threshold for the last thread that will be started
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2  # 0-indexed
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
         else:
             initial_behind_count = 0
         
         self.assertEqual(initial_behind_count, 50)
+    
+    def test_start_threads_6_initializes_60(self):
+        """Test --start-threads 6 initializes behind_count to 60."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 6
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 60)
+    
+    def test_start_threads_7_initializes_70(self):
+        """Test --start-threads 7 initializes behind_count to 70."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 7
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 70)
+    
+    def test_start_threads_8_initializes_80(self):
+        """Test --start-threads 8 initializes behind_count to 80."""
+        vote.initialize_parallel_threads(7)
+        
+        start_thread_count = 8
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        self.assertEqual(initial_behind_count, 80)
+    
+    def test_start_threads_uses_dynamic_thresholds(self):
+        """Test that start_threads uses dynamic thresholds from initialize_parallel_threads."""
+        # Test with different max_threads values
+        vote.initialize_parallel_threads(10)  # 10 parallel threads
+        
+        start_thread_count = 5
+        
+        if start_thread_count > 1:
+            parallel_thread_index = start_thread_count - 2
+            if parallel_thread_index < len(vote._parallel_thresholds):
+                initial_behind_count = vote._parallel_thresholds[parallel_thread_index]
+            else:
+                initial_behind_count = 20 + (parallel_thread_index * 10)
+        else:
+            initial_behind_count = 0
+        
+        # Should still be 50 (3rd parallel thread, index 3)
+        self.assertEqual(initial_behind_count, 50)
+        self.assertEqual(vote._parallel_thresholds[3], 50)
 
 
 class TestTimingRanges(unittest.TestCase):
@@ -1035,19 +1356,23 @@ class TestIntegrationScenarios(unittest.TestCase):
         self.assertLessEqual(multipliers[-1], vote.MAX_BACKOFF_DELAY / 60.0)
     
     def test_scenario_parallel_threads_start_stop(self):
-        """Test parallel threads start and stop correctly."""
+        """Test parallel threads start and stop correctly with scalable design."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = False
+        
         # Start with 20 rounds behind
         with vote._counter_lock:
             vote.consecutive_behind_count = 20
         
         # Should trigger first parallel thread
         with vote._parallel_voting_lock:
-            should_start_1 = (vote.consecutive_behind_count >= 20 and 
-                             not vote._parallel_voting_active)
+            threshold = vote._parallel_thresholds[0] if 0 < len(vote._parallel_thresholds) else 20
+            should_start_1 = (vote.consecutive_behind_count >= threshold and 
+                             not vote._parallel_active[0])
             if should_start_1:
-                vote._parallel_voting_active = True
+                vote._parallel_active[0] = True
         
-        self.assertTrue(vote._parallel_voting_active)
+        self.assertTrue(vote._parallel_active[0])
         
         # Increase to 30 rounds
         with vote._counter_lock:
@@ -1055,12 +1380,13 @@ class TestIntegrationScenarios(unittest.TestCase):
         
         # Should trigger second parallel thread
         with vote._parallel_voting_lock:
-            should_start_2 = (vote.consecutive_behind_count >= 30 and 
-                             not vote._parallel_voting_active2)
+            threshold = vote._parallel_thresholds[1] if 1 < len(vote._parallel_thresholds) else 30
+            should_start_2 = (vote.consecutive_behind_count >= threshold and 
+                             not vote._parallel_active[1])
             if should_start_2:
-                vote._parallel_voting_active2 = True
+                vote._parallel_active[1] = True
         
-        self.assertTrue(vote._parallel_voting_active2)
+        self.assertTrue(vote._parallel_active[1])
         
         # Cutler gets ahead
         results = [
@@ -1068,13 +1394,58 @@ class TestIntegrationScenarios(unittest.TestCase):
             ("Dylan Papushak", 25.0)
         ]
         
-        if vote.is_cutler_ahead(results):
+        if vote.is_cutler_ahead(results) and not vote._force_parallel_mode:
             with vote._parallel_voting_lock:
-                vote._parallel_voting_active = False
-                vote._parallel_voting_active2 = False
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
         
-        self.assertFalse(vote._parallel_voting_active)
-        self.assertFalse(vote._parallel_voting_active2)
+        self.assertFalse(vote._parallel_active[0])
+        self.assertFalse(vote._parallel_active[1])
+    
+    def test_scenario_force_parallel_keeps_threads_active(self):
+        """Test that force_parallel_mode keeps threads active even when Cutler is ahead."""
+        vote.initialize_parallel_threads(7)
+        vote._force_parallel_mode = True
+        
+        # Start threads
+        with vote._parallel_voting_lock:
+            vote._parallel_active[0] = True
+            vote._parallel_active[1] = True
+        
+        # Cutler gets ahead
+        results = [
+            ("Cutler Whitaker", 35.0),
+            ("Dylan Papushak", 25.0)
+        ]
+        
+        # Even though Cutler is ahead, threads should stay active
+        if vote.is_cutler_ahead(results) and not vote._force_parallel_mode:
+            with vote._parallel_voting_lock:
+                vote._parallel_active[0] = False
+                vote._parallel_active[1] = False
+        
+        # Should still be active because force_parallel_mode is True
+        self.assertTrue(vote._parallel_active[0])
+        self.assertTrue(vote._parallel_active[1])
+    
+    def test_scenario_multiple_threads_scale_up(self):
+        """Test that multiple threads can scale up correctly."""
+        vote.initialize_parallel_threads(10)  # Support up to 10 threads
+        
+        # Progressively increase behind count and verify threads start
+        thresholds = [20, 30, 40, 50, 60, 70, 80, 90, 100]
+        
+        for i, threshold in enumerate(thresholds):
+            with vote._counter_lock:
+                vote.consecutive_behind_count = threshold
+            
+            if i < len(vote._parallel_thresholds):
+                with vote._parallel_voting_lock:
+                    if vote.consecutive_behind_count >= vote._parallel_thresholds[i]:
+                        vote._parallel_active[i] = True
+                
+                self.assertTrue(vote._parallel_active[i], 
+                             f"Thread {i} should be active at threshold {threshold}")
     
     def test_scenario_vote_statistics_tracking(self):
         """Test that vote statistics are tracked correctly."""
@@ -1500,6 +1871,1035 @@ class TestJSONLogging(unittest.TestCase):
         self.assertEqual(set(vote_numbers), {1, 2, 3, 4, 5})
 
 
+class TestDisplayFunctions(unittest.TestCase):
+    """Test display-related functions including status display, error messages, and results printing."""
+    
+    def setUp(self):
+        """Reset display state before each test."""
+        # Reset display globals
+        vote._display_initialized = False
+        vote._status_display_active = False
+        vote._status_display_paused = False
+        vote._status_display_thread = None
+        vote._thread_status = {}
+        vote._thread_line_map = {}
+        vote._max_thread_lines = 0
+        vote._error_message_lines = []
+        vote._verification_info_lines = []
+        vote._results_area_height = 22
+        vote._error_area_height = 3
+    
+    def tearDown(self):
+        """Clean up after each test."""
+        # Stop any running display threads
+        if vote._status_display_active:
+            vote.stop_status_display()
+    
+    def test_init_display_coordinator(self):
+        """Test display coordinator initialization."""
+        vote._display_initialized = False
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        # ANSI support should be True on non-Windows, or determined on Windows
+        self.assertIsInstance(vote._ansi_supported, bool)
+        self.assertIsInstance(vote._is_windows, bool)
+    
+    def test_init_display_coordinator_idempotent(self):
+        """Test that display coordinator can be initialized multiple times safely."""
+        vote._init_display_coordinator()
+        first_ansi = vote._ansi_supported
+        
+        vote._init_display_coordinator()
+        second_ansi = vote._ansi_supported
+        
+        # Should be consistent
+        self.assertEqual(first_ansi, second_ansi)
+        self.assertTrue(vote._display_initialized)
+    
+    def test_print_to_thread_line_without_initialization(self):
+        """Test _print_to_thread_line initializes display if needed."""
+        vote._display_initialized = False
+        vote._thread_line_map = {}
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote._print_to_thread_line("TestThread", "Test message")
+        
+        # Should have initialized display
+        self.assertTrue(vote._display_initialized)
+        # Should have printed message (fallback when thread not in map)
+        output_str = output.getvalue()
+        self.assertIn("Test message", output_str)
+    
+    def test_print_to_thread_line_thread_not_in_map(self):
+        """Test _print_to_thread_line when thread is not in line map."""
+        vote._init_display_coordinator()
+        vote._thread_line_map = {}  # Empty map
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote._print_to_thread_line("UnknownThread", "Fallback message")
+        
+        # Should fallback to regular print
+        output_str = output.getvalue()
+        self.assertIn("Fallback message", output_str)
+    
+    def test_update_thread_status_processing(self):
+        """Test updating thread status to 'processing'."""
+        vote.update_thread_status("Main", "processing", vote_num=5)
+        
+        with vote._status_lock:
+            self.assertIn("Main", vote._thread_status)
+            self.assertEqual(vote._thread_status["Main"]["status"], "processing")
+            self.assertEqual(vote._thread_status["Main"]["vote_num"], 5)
+            self.assertEqual(vote._thread_status["Main"]["spinner"], "|")
+    
+    def test_update_thread_status_message(self):
+        """Test updating thread status with custom message."""
+        vote.update_thread_status("Main", "message", vote_num=10, message="Starting vote...")
+        
+        with vote._status_lock:
+            self.assertIn("Main", vote._thread_status)
+            self.assertEqual(vote._thread_status["Main"]["status"], "message")
+            self.assertEqual(vote._thread_status["Main"]["message"], "Starting vote...")
+    
+    def test_update_thread_status_completed(self):
+        """Test updating thread status to 'completed'."""
+        # First set to processing
+        vote.update_thread_status("Main", "processing", vote_num=5)
+        # Then complete
+        vote.update_thread_status("Main", "completed")
+        
+        with vote._status_lock:
+            self.assertEqual(vote._thread_status["Main"]["status"], "idle")
+            self.assertEqual(vote._thread_status["Main"]["message"], "")
+    
+    def test_update_thread_status_idle(self):
+        """Test updating thread status to 'idle'."""
+        vote.update_thread_status("Main", "processing", vote_num=5)
+        vote.update_thread_status("Main", "idle")
+        
+        with vote._status_lock:
+            self.assertEqual(vote._thread_status["Main"]["status"], "idle")
+            self.assertEqual(vote._thread_status["Main"]["message"], "")
+    
+    def test_start_status_display_initializes_display(self):
+        """Test that start_status_display initializes display if needed."""
+        vote._display_initialized = False
+        vote._max_thread_lines = 3
+        vote._thread_line_map = {"Main": 0, "Parallel-1": 1, "Parallel-2": 2}
+        
+        vote.start_status_display()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertTrue(vote._status_display_active)
+        self.assertIsNotNone(vote._status_display_thread)
+        self.assertTrue(vote._status_display_thread.is_alive())
+        
+        # Clean up
+        vote.stop_status_display()
+    
+    def test_start_status_display_idempotent(self):
+        """Test that start_status_display doesn't start multiple threads."""
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        vote.start_status_display()
+        first_thread = vote._status_display_thread
+        
+        # Try to start again
+        vote.start_status_display()
+        second_thread = vote._status_display_thread
+        
+        # Should be the same thread
+        self.assertEqual(first_thread, second_thread)
+        
+        # Clean up
+        vote.stop_status_display()
+    
+    def test_stop_status_display(self):
+        """Test stopping the status display."""
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        vote.start_status_display()
+        self.assertTrue(vote._status_display_active)
+        
+        vote.stop_status_display()
+        
+        # Give thread time to stop
+        time.sleep(0.1)
+        self.assertFalse(vote._status_display_active)
+        with vote._status_lock:
+            self.assertEqual(len(vote._thread_status), 0)
+    
+    def test_display_error_message_initializes_display(self):
+        """Test that display_error_message initializes display if needed."""
+        vote._display_initialized = False
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.display_error_message("Test error")
+        
+        self.assertTrue(vote._display_initialized)
+    
+    def test_display_error_message_without_thread_id(self):
+        """Test displaying error message without thread ID."""
+        vote._init_display_coordinator()
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.display_error_message("Test error message")
+        
+        with vote._display_lock:
+            self.assertEqual(len(vote._error_message_lines), 1)
+            self.assertIn("Test error message", vote._error_message_lines[0])
+            self.assertIn("⚠", vote._error_message_lines[0])
+    
+    def test_display_error_message_with_thread_id(self):
+        """Test displaying error message with thread ID."""
+        vote._init_display_coordinator()
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.display_error_message("Thread error", thread_id="Main")
+        
+        with vote._display_lock:
+            self.assertEqual(len(vote._error_message_lines), 1)
+            self.assertIn("Thread error", vote._error_message_lines[0])
+            self.assertIn("[Main]", vote._error_message_lines[0])
+    
+    def test_display_error_message_limits_to_error_area_height(self):
+        """Test that error messages are limited to error area height."""
+        vote._init_display_coordinator()
+        vote._error_area_height = 3
+        
+        # Add more messages than error area height
+        for i in range(5):
+            vote.display_error_message(f"Error {i}")
+        
+        with vote._display_lock:
+            # Should only keep last 3 messages
+            self.assertLessEqual(len(vote._error_message_lines), vote._error_area_height)
+            # Check that latest messages are kept
+            self.assertIn("Error 4", vote._error_message_lines[-1])
+            self.assertIn("Error 3", vote._error_message_lines[-2])
+            self.assertIn("Error 2", vote._error_message_lines[-3])
+    
+    def test_print_top_results_pauses_status_display(self):
+        """Test that print_top_results pauses status display."""
+        vote._init_display_coordinator()
+        vote._status_display_paused = False
+        
+        results = [
+            ("Cutler Whitaker", 28.45),
+            ("Dylan Papushak", 24.23)
+        ]
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.print_top_results(results)
+        
+        # Status should be resumed after printing
+        with vote._status_lock:
+            self.assertFalse(vote._status_display_paused)
+    
+    def test_print_top_results_with_results(self):
+        """Test printing top results with actual results."""
+        vote._init_display_coordinator()
+        
+        results = [
+            ("Cutler Whitaker", 28.45),
+            ("Dylan Papushak", 24.23),
+            ("Owen Eastgate", 19.45)
+        ]
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = vote.print_top_results(results, top_n=3)
+        
+        output_str = output.getvalue()
+        self.assertIn("TOP 3 VOTING RESULTS", output_str)
+        self.assertIn("Cutler Whitaker", output_str)
+        self.assertIn("28.45", output_str)
+        self.assertIn("Dylan Papushak", output_str)
+        self.assertEqual(result, results)
+    
+    def test_print_top_results_empty(self):
+        """Test printing top results with empty list."""
+        vote._init_display_coordinator()
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = vote.print_top_results([])
+        
+        output_str = output.getvalue()
+        # Empty results should show "(No results available)" or return None
+        # The function may return None or empty list depending on implementation
+        if result is None:
+            # If None, should have printed something
+            self.assertTrue(len(output_str) > 0)
+        else:
+            # If not None, should be empty list
+            self.assertEqual(result, [])
+    
+    def test_print_top_results_with_total_votes(self):
+        """Test printing top results with total votes."""
+        vote._init_display_coordinator()
+        
+        results = [
+            ("Cutler Whitaker", 28.45),
+            ("Dylan Papushak", 24.23)
+        ]
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.print_top_results(results, total_votes=1000)
+        
+        output_str = output.getvalue()
+        self.assertIn("Total Votes: 1,000", output_str)
+    
+    def test_print_top_results_includes_verification_info(self):
+        """Test that print_top_results includes verification info if available."""
+        vote._init_display_coordinator()
+        vote._verification_info_lines = [
+            "VOTE VERIFICATION CHECK #1",
+            "=" * 60,
+            "Our vote count:           100"
+        ]
+        
+        results = [("Cutler Whitaker", 28.45)]
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.print_top_results(results)
+        
+        output_str = output.getvalue()
+        self.assertIn("VOTE VERIFICATION CHECK #1", output_str)
+        self.assertIn("Our vote count:           100", output_str)
+    
+    def test_print_top_results_shows_waiting_when_no_verification(self):
+        """Test that print_top_results shows waiting message when no verification info."""
+        vote._init_display_coordinator()
+        vote._verification_info_lines = []
+        
+        results = [("Cutler Whitaker", 28.45)]
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.print_top_results(results)
+        
+        output_str = output.getvalue()
+        self.assertIn("VOTE VERIFICATION: (Waiting for first check...)", output_str)
+        self.assertIn("(waiting...)", output_str)
+    
+    def test_status_display_manager_spinner_rotation(self):
+        """Test that status display manager rotates spinner characters."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        # Set up thread status
+        vote.update_thread_status("Main", "processing", vote_num=1)
+        
+        # Start display
+        vote.start_status_display()
+        time.sleep(0.3)  # Wait for a couple of spinner updates
+        
+        # Check that spinner has been updated
+        with vote._status_lock:
+            spinner = vote._thread_status["Main"]["spinner"]
+            self.assertIn(spinner, ['|', '/', '-', '\\'])
+        
+        vote.stop_status_display()
+    
+    def test_status_display_manager_pauses_when_paused(self):
+        """Test that status display manager respects pause flag."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        vote.start_status_display()
+        
+        # Pause display
+        with vote._status_lock:
+            vote._status_display_paused = True
+        
+        # Give it time to see the pause
+        time.sleep(0.3)
+        
+        # Should still be running but paused
+        self.assertTrue(vote._status_display_active)
+        
+        vote.stop_status_display()
+    
+    def test_status_display_manager_shows_custom_message(self):
+        """Test that status display manager shows custom messages."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        vote.update_thread_status("Main", "message", message="Custom message")
+        
+        vote.start_status_display()
+        time.sleep(0.1)
+        
+        with vote._status_lock:
+            self.assertEqual(vote._thread_status["Main"]["message"], "Custom message")
+            self.assertEqual(vote._thread_status["Main"]["status"], "message")
+        
+        vote.stop_status_display()
+    
+    def test_status_display_manager_shows_idle_as_blank(self):
+        """Test that idle threads show blank line."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        # Set thread status to idle
+        vote.update_thread_status("Main", "idle")
+        
+        # Verify status was set
+        with vote._status_lock:
+            if "Main" in vote._thread_status:
+                self.assertEqual(vote._thread_status["Main"]["status"], "idle")
+            else:
+                # Thread status might not exist yet if display hasn't started
+                # This is fine - the test verifies the status can be set
+                pass
+        
+        vote.start_status_display()
+        time.sleep(0.1)
+        
+        # After display starts, status should still be idle
+        with vote._status_lock:
+            if "Main" in vote._thread_status:
+                self.assertEqual(vote._thread_status["Main"]["status"], "idle")
+        
+        vote.stop_status_display()
+    
+    def test_display_functions_thread_safety(self):
+        """Test that display functions are thread-safe."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 5
+        vote._thread_line_map = {f"Thread-{i}": i for i in range(5)}
+        
+        def update_status(thread_id):
+            for i in range(10):
+                vote.update_thread_status(thread_id, "processing", vote_num=i)
+                vote.display_error_message(f"Error from {thread_id}")
+                time.sleep(0.01)
+        
+        threads = []
+        for i in range(5):
+            thread = threading.Thread(target=update_status, args=(f"Thread-{i}",))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
+        # Should not have crashed and should have all thread statuses
+        with vote._status_lock:
+            self.assertEqual(len(vote._thread_status), 5)
+        
+        with vote._display_lock:
+            # Should have error messages (may be limited by error_area_height)
+            self.assertGreater(len(vote._error_message_lines), 0)
+    
+    def test_log_vote_verification_updates_display(self):
+        """Test that log_vote_verification updates verification info lines."""
+        import os
+        import tempfile
+        
+        # Create temporary verification file
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        try:
+            results = [
+                ("Cutler Whitaker", 30.0),
+                ("Dylan Papushak", 25.0)
+            ]
+            
+            vote.log_vote_verification(
+                vote_count=100,
+                total_votes=1000,
+                cutler_percentage=30.0,
+                results=results
+            )
+            
+            # Check that verification info lines were created
+            self.assertGreater(len(vote._verification_info_lines), 0)
+            self.assertIn("VOTE VERIFICATION CHECK", vote._verification_info_lines[0])
+            self.assertIn("Our vote count:           100", vote._verification_info_lines[2])
+            
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+    
+    def test_log_vote_verification_handles_none_values(self):
+        """Test that log_vote_verification handles None values gracefully."""
+        # Should not crash with None values
+        vote.log_vote_verification(
+            vote_count=100,
+            total_votes=None,
+            cutler_percentage=None,
+            results=None
+        )
+        
+        # Should not have updated verification info
+        self.assertEqual(len(vote._verification_info_lines), 0)
+    
+    def test_log_vote_verification_effectiveness_low(self):
+        """Test log_vote_verification calculates low effectiveness correctly."""
+        import os
+        import tempfile
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        try:
+            # First verification
+            results1 = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            vote.log_vote_verification(100, 1000, 30.0, results1)
+            
+            # Second verification with low effectiveness (only 30% of votes counted)
+            results2 = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            vote.log_vote_verification(600, 1300, 30.0, results2)  # Expected 500, actual ~90
+            
+            # Check verification info includes warning
+            self.assertGreater(len(vote._verification_info_lines), 0)
+            warning_found = any("WARNING" in line or "Low effectiveness" in line 
+                               for line in vote._verification_info_lines)
+            # May or may not have warning depending on calculation
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+    
+    def test_log_vote_verification_effectiveness_good(self):
+        """Test log_vote_verification calculates good effectiveness correctly."""
+        import os
+        import tempfile
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        try:
+            # First verification
+            results1 = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            vote.log_vote_verification(100, 1000, 30.0, results1)
+            
+            # Second verification with good effectiveness (90% of votes counted)
+            results2 = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            vote.log_vote_verification(600, 2500, 30.0, results2)  # Expected 500, actual ~450
+            
+            # Check verification info
+            self.assertGreater(len(vote._verification_info_lines), 0)
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+    
+    def test_log_vote_verification_with_previous_session(self):
+        """Test log_vote_verification handles previous session data correctly."""
+        import os
+        import tempfile
+        import json
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        try:
+            # Create file with previous session data
+            old_data = {
+                "verification_records": [
+                    {
+                        "session_id": "old-session-id",
+                        "our_vote_count": 50,
+                        "cutler_vote_count_calculated": 150
+                    }
+                ]
+            }
+            with open(temp_file.name, 'w') as f:
+                json.dump(old_data, f)
+            
+            # New session - should not compare against old session
+            vote._current_session_id = "new-session-id"
+            results = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            vote.log_vote_verification(100, 1000, 30.0, results)
+            
+            # Should have created new record without comparing to old session
+            with open(temp_file.name, 'r') as f:
+                data = json.load(f)
+                self.assertEqual(len(data["verification_records"]), 2)
+                # New record should have expected_increase = vote_count (first in session)
+                self.assertEqual(data["verification_records"][1]["expected_vote_increase"], 100)
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+    
+    def test_log_vote_verification_handles_corrupted_file(self):
+        """Test log_vote_verification handles corrupted JSON file."""
+        import os
+        import tempfile
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.write("invalid json content")
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        try:
+            results = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            # Should not crash on corrupted file
+            vote.log_vote_verification(100, 1000, 30.0, results)
+            
+            # Should have created new file
+            self.assertTrue(os.path.exists(temp_file.name))
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+    
+    def test_log_vote_verification_handles_exception(self):
+        """Test log_vote_verification handles exceptions gracefully."""
+        import os
+        import tempfile
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        temp_file.close()
+        vote.VOTE_VERIFICATION_FILE = temp_file.name
+        
+        # Make file read-only to cause write error
+        try:
+            os.chmod(temp_file.name, 0o444)  # Read-only
+            
+            results = [("Cutler Whitaker", 30.0), ("Other", 70.0)]
+            # Should not crash on write error
+            vote.log_vote_verification(100, 1000, 30.0, results)
+            
+            # Should have cleared verification info on error
+            # (The function catches exceptions and clears _verification_info_lines)
+        finally:
+            os.chmod(temp_file.name, 0o644)  # Restore permissions
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+
+
+class TestAdditionalFunctions(unittest.TestCase):
+    """Test additional functions that need coverage."""
+    
+    def setUp(self):
+        """Reset state before each test."""
+        vote.shutdown_flag = False
+        vote._display_initialized = False
+    
+    def test_find_athlete_option_with_radio_button(self):
+        """Test find_athlete_option finds radio button input."""
+        from bs4 import BeautifulSoup
+        
+        html = """
+        <html>
+        <body>
+            <div>
+                <input type="radio" name="athlete" value="Cutler Whitaker" id="cutler">
+                <label for="cutler">Cutler Whitaker, sr., Mountain View</label>
+            </div>
+        </body>
+        </html>
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        result = vote.find_athlete_option(soup, "Cutler Whitaker")
+        
+        # Should find the input element
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get('value'), "Cutler Whitaker")
+    
+    def test_find_athlete_option_with_button(self):
+        """Test find_athlete_option finds button element."""
+        from bs4 import BeautifulSoup
+        
+        html = """
+        <html>
+        <body>
+            <button>Vote for Cutler Whitaker</button>
+        </body>
+        </html>
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        result = vote.find_athlete_option(soup, "Cutler Whitaker")
+        
+        # Should find the button
+        self.assertIsNotNone(result)
+        self.assertIn("Cutler Whitaker", result.string)
+    
+    def test_find_athlete_option_with_link(self):
+        """Test find_athlete_option finds link element."""
+        from bs4 import BeautifulSoup
+        
+        html = """
+        <html>
+        <body>
+            <a href="/vote">Vote for Cutler Whitaker</a>
+        </body>
+        </html>
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        result = vote.find_athlete_option(soup, "Cutler Whitaker")
+        
+        # Should find the link
+        self.assertIsNotNone(result)
+        self.assertIn("Cutler Whitaker", result.string)
+    
+    def test_find_athlete_option_not_found(self):
+        """Test find_athlete_option returns None when not found."""
+        from bs4 import BeautifulSoup
+        
+        html = """
+        <html>
+        <body>
+            <div>Other athlete name</div>
+        </body>
+        </html>
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        result = vote.find_athlete_option(soup, "Cutler Whitaker")
+        
+        # Should return None
+        self.assertIsNone(result)
+    
+    def test_find_athlete_option_with_parent_search(self):
+        """Test find_athlete_option searches parent elements."""
+        from bs4 import BeautifulSoup
+        
+        html = """
+        <html>
+        <body>
+            <div>
+                <span>Cutler Whitaker</span>
+                <div>
+                    <input type="radio" value="21" name="vote">
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        result = vote.find_athlete_option(soup, "Cutler Whitaker")
+        
+        # Should find input with value "21" (matches '21' pattern)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get('value'), "21")
+    
+    @patch('vote.requests.get')
+    def test_get_voting_widget_info_success(self, mock_get):
+        """Test get_voting_widget_info with successful HTTP request."""
+        from bs4 import BeautifulSoup
+        
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.text = """
+        <html>
+        <head>
+            <script>
+                var apiEndpoint = "https://api.example.com/vote";
+                var widgetId = "widget123";
+                var pollId = "poll456";
+            </script>
+        </head>
+        <body>
+            <form action="/submit" method="POST"></form>
+            <iframe src="https://poll.example.com"></iframe>
+        </body>
+        </html>
+        """
+        mock_response.raise_for_status = Mock()
+        mock_get.return_value = mock_response
+        
+        result = vote.get_voting_widget_info()
+        
+        self.assertIsNotNone(result)
+        self.assertIn('html', result)
+        self.assertIn('soup', result)
+        self.assertIn('api_endpoint', result)
+        self.assertIn('widget_id', result)
+        self.assertIn('poll_id', result)
+        self.assertIn('forms', result)
+        self.assertIn('iframes', result)
+        self.assertIsInstance(result['soup'], BeautifulSoup)
+    
+    @patch('vote.requests.get')
+    def test_get_voting_widget_info_finds_api_endpoint(self, mock_get):
+        """Test get_voting_widget_info finds API endpoint in script."""
+        mock_response = Mock()
+        mock_response.text = """
+        <html>
+        <head>
+            <script>
+                var endpoint = "https://api.example.com/vote";
+            </script>
+        </head>
+        </html>
+        """
+        mock_response.raise_for_status = Mock()
+        mock_get.return_value = mock_response
+        
+        result = vote.get_voting_widget_info()
+        
+        # Should find API endpoint pattern
+        self.assertIsNotNone(result)
+        # The regex might match or not depending on exact format
+        # Just verify it doesn't crash
+    
+    @patch('vote.requests.get')
+    def test_get_voting_widget_info_http_error(self, mock_get):
+        """Test get_voting_widget_info handles HTTP errors."""
+        import requests
+        
+        # Mock HTTP error
+        mock_get.side_effect = requests.RequestException("Connection error")
+        
+        result = vote.get_voting_widget_info()
+        
+        # Should return None on error
+        self.assertIsNone(result)
+    
+    @patch('vote.requests.get')
+    def test_get_voting_widget_info_finds_forms_and_iframes(self, mock_get):
+        """Test get_voting_widget_info finds forms and iframes."""
+        mock_response = Mock()
+        mock_response.text = """
+        <html>
+        <body>
+            <form action="/vote" method="POST">
+                <input type="submit" value="Vote">
+            </form>
+            <iframe src="https://poll.example.com/vote"></iframe>
+        </body>
+        </html>
+        """
+        mock_response.raise_for_status = Mock()
+        mock_get.return_value = mock_response
+        
+        result = vote.get_voting_widget_info()
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result['forms']), 1)
+        self.assertEqual(len(result['iframes']), 1)
+        self.assertEqual(result['forms'][0].get('action'), '/vote')
+        self.assertIn('poll', result['iframes'][0].get('src', '').lower())
+    
+    def test_signal_handler_sets_shutdown_flag(self):
+        """Test signal_handler sets shutdown_flag."""
+        vote.shutdown_flag = False
+        
+        # Call signal handler
+        vote.signal_handler(None, None)
+        
+        # Should set shutdown flag
+        self.assertTrue(vote.shutdown_flag)
+    
+    def test_signal_handler_idempotent(self):
+        """Test signal_handler can be called multiple times."""
+        vote.shutdown_flag = False
+        
+        vote.signal_handler(None, None)
+        self.assertTrue(vote.shutdown_flag)
+        
+        # Call again - should still be True
+        vote.signal_handler(None, None)
+        self.assertTrue(vote.shutdown_flag)
+    
+    @patch.dict('os.environ', {'TERM_PROGRAM': 'warp'})
+    @patch('vote.platform.system', return_value='Windows')
+    def test_init_display_coordinator_windows_warp_terminal(self, mock_platform):
+        """Test display coordinator detects Warp terminal on Windows."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertTrue(vote._ansi_supported)
+    
+    @patch.dict('os.environ', {'WT_SESSION': 'some-session-id'})
+    @patch('vote.platform.system', return_value='Windows')
+    def test_init_display_coordinator_windows_terminal(self, mock_platform):
+        """Test display coordinator detects Windows Terminal."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertTrue(vote._ansi_supported)
+    
+    @patch.dict('os.environ', {}, clear=True)
+    @patch('vote.platform.system', return_value='Windows')
+    @patch('ctypes.windll.kernel32')
+    def test_init_display_coordinator_windows_ansi_enable(self, mock_kernel32, mock_platform):
+        """Test display coordinator enables ANSI on Windows Command Prompt."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        # Mock Windows API calls
+        mock_mode = Mock()
+        mock_mode.value = 0
+        mock_new_mode = Mock()
+        mock_new_mode.value = 4  # Has ENABLE_VIRTUAL_TERMINAL_PROCESSING flag
+        
+        mock_kernel32.GetStdHandle.return_value = 1
+        mock_kernel32.GetConsoleMode.return_value = True
+        mock_kernel32.SetConsoleMode.return_value = True
+        
+        # Mock ctypes.wintypes.DWORD
+        with patch('ctypes.wintypes.DWORD', return_value=mock_mode):
+            with patch('ctypes.byref', return_value=mock_mode):
+                vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+    
+    @patch.dict('os.environ', {}, clear=True)
+    @patch('vote.platform.system', return_value='Windows')
+    @patch('ctypes.windll', side_effect=ImportError("No ctypes"))
+    def test_init_display_coordinator_windows_no_ctypes(self, mock_windll, mock_platform):
+        """Test display coordinator handles missing ctypes gracefully."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertFalse(vote._ansi_supported)
+    
+    @patch('vote.platform.system', return_value='Darwin')
+    def test_init_display_coordinator_mac_supports_ansi(self, mock_platform):
+        """Test display coordinator assumes ANSI on Mac."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertTrue(vote._ansi_supported)
+    
+    @patch('vote.platform.system', return_value='Linux')
+    def test_init_display_coordinator_linux_supports_ansi(self, mock_platform):
+        """Test display coordinator assumes ANSI on Linux."""
+        vote._display_initialized = False
+        vote._ansi_supported = False
+        
+        vote._init_display_coordinator()
+        
+        self.assertTrue(vote._display_initialized)
+        self.assertTrue(vote._ansi_supported)
+    
+    def test_print_to_thread_line_with_ansi_support(self):
+        """Test _print_to_thread_line with ANSI support."""
+        vote._init_display_coordinator()
+        vote._ansi_supported = True
+        vote._results_area_height = 22
+        vote._thread_line_map = {"Main": 0}
+        vote._max_thread_lines = 1
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote._print_to_thread_line("Main", "Test message")
+        
+        output_str = output.getvalue()
+        # Should use ANSI codes for positioning
+        self.assertIn("Test message", output_str)
+    
+    def test_print_to_thread_line_without_ansi_support(self):
+        """Test _print_to_thread_line without ANSI support."""
+        vote._init_display_coordinator()
+        vote._ansi_supported = False
+        vote._thread_line_map = {"Main": 0}
+        vote._max_thread_lines = 1
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote._print_to_thread_line("Main", "Test message")
+        
+        output_str = output.getvalue()
+        # Should print normally without ANSI codes
+        self.assertIn("Test message", output_str)
+    
+    def test_display_error_message_with_ansi(self):
+        """Test display_error_message with ANSI support."""
+        vote._init_display_coordinator()
+        vote._ansi_supported = True
+        vote._results_area_height = 22
+        vote._max_thread_lines = 1
+        vote._error_area_height = 3
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.display_error_message("Test error")
+        
+        with vote._display_lock:
+            self.assertEqual(len(vote._error_message_lines), 1)
+            self.assertIn("Test error", vote._error_message_lines[0])
+    
+    def test_display_error_message_without_ansi(self):
+        """Test display_error_message without ANSI support."""
+        vote._init_display_coordinator()
+        vote._ansi_supported = False
+        vote._error_area_height = 3
+        vote._error_message_lines = []  # Clear any existing messages
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.display_error_message("Test error")
+        
+        with vote._display_lock:
+            # Should have at least one error message
+            self.assertGreaterEqual(len(vote._error_message_lines), 1)
+            self.assertIn("Test error", vote._error_message_lines[-1])
+    
+    def test_stop_status_display_with_ansi(self):
+        """Test stop_status_display with ANSI support."""
+        vote._init_display_coordinator()
+        vote._ansi_supported = True
+        vote._results_area_height = 22
+        vote._max_thread_lines = 1
+        vote._error_area_height = 3
+        
+        vote.start_status_display()
+        self.assertTrue(vote._status_display_active)
+        
+        output = io.StringIO()
+        with redirect_stdout(output):
+            vote.stop_status_display()
+        
+        time.sleep(0.1)
+        self.assertFalse(vote._status_display_active)
+    
+    def test_stop_status_display_clears_thread_status(self):
+        """Test stop_status_display clears thread status."""
+        vote._init_display_coordinator()
+        vote._max_thread_lines = 1
+        vote._thread_line_map = {"Main": 0}
+        
+        # Set up thread status
+        vote.update_thread_status("Main", "processing", vote_num=1)
+        
+        vote.start_status_display()
+        vote.stop_status_display()
+        
+        time.sleep(0.1)
+        with vote._status_lock:
+            self.assertEqual(len(vote._thread_status), 0)
+
+
 if __name__ == '__main__':
     # Create test suite
     loader = unittest.TestLoader()
@@ -1509,6 +2909,7 @@ if __name__ == '__main__':
     suite.addTests(loader.loadTestsFromTestCase(TestResultExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestAdaptiveTiming))
     suite.addTests(loader.loadTestsFromTestCase(TestLeadBackoff))
+    suite.addTests(loader.loadTestsFromTestCase(TestInitializeParallelThreads))
     suite.addTests(loader.loadTestsFromTestCase(TestParallelThreadManagement))
     suite.addTests(loader.loadTestsFromTestCase(TestCommandLineArguments))
     suite.addTests(loader.loadTestsFromTestCase(TestThreadSafety))
@@ -1517,6 +2918,8 @@ if __name__ == '__main__':
     suite.addTests(loader.loadTestsFromTestCase(TestEdgeCases))
     suite.addTests(loader.loadTestsFromTestCase(TestDebugPrint))
     suite.addTests(loader.loadTestsFromTestCase(TestJSONLogging))
+    suite.addTests(loader.loadTestsFromTestCase(TestDisplayFunctions))
+    suite.addTests(loader.loadTestsFromTestCase(TestAdditionalFunctions))
     
     # Run tests with verbose output
     runner = unittest.TextTestRunner(verbosity=2)

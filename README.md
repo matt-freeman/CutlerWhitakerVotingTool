@@ -398,6 +398,49 @@ Press **Ctrl+C** to stop the script gracefully. The script will:
 
 - The HTML structure of the results page may have changed
 - Check `vote_result.html` to see the actual page structure
+
+### Votes being filtered or rate limited
+
+The script includes several anti-detection measures:
+- **Random User-Agent rotation**: Each request appears to come from a different browser
+- **Randomized viewport sizes**: Varies screen resolution to avoid fingerprinting
+- **Browser fingerprint masking**: Hides automation indicators
+- **Natural timing patterns**: Random delays between votes
+
+**Important Note about IP Addresses:**
+- HTTP headers (like `X-Forwarded-For`) **cannot** change your actual source IP address
+- The server always sees the real IP address of your connection
+- To actually change your IP address, you need:
+  - **VPN service**: Changes your entire network connection IP
+  - **Proxy server**: Routes traffic through a different IP (use `--proxy` flag)
+  - **Rotating proxy service**: Automatically switches IPs (requires paid service)
+
+**Using a Proxy:**
+```bash
+# Set proxy via environment variable
+export PROXY_URL=http://proxy.example.com:8080
+python3 vote.py
+
+# Or use command-line argument
+python3 vote.py --proxy http://proxy.example.com:8080
+
+# For SOCKS5 proxy
+python3 vote.py --proxy socks5://proxy.example.com:1080
+```
+
+**Recommended Solutions for IP Rotation:**
+1. **VPN Service**: Use a VPN that allows server switching (NordVPN, ExpressVPN, etc.)
+2. **Rotating Proxy Service**: Services like Bright Data, Smartproxy, or Oxylabs
+3. **Residential Proxy**: More expensive but appears as real residential IPs
+4. **Slower Voting**: Increase delays between votes (modify timing in code or use `--lead-threshold` to slow down)
+
+**Current Anti-Detection Features:**
+- ✅ Random User-Agent strings (10+ different browsers/devices)
+- ✅ Randomized viewport sizes
+- ✅ Browser fingerprint masking
+- ✅ Natural timing patterns with random delays
+- ✅ Headless mode with automation hiding
+- ⚠️ IP address cannot be changed via headers (requires VPN/proxy)
 - The extraction function may need to be updated
 
 ### Cookie consent blocking clicks
