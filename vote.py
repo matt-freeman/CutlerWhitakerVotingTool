@@ -132,7 +132,7 @@ def _init_display_coordinator():
     else:
         # Windows: Try to enable and verify ANSI support
         # Modern terminals (Windows Terminal, Warp) support ANSI natively
-        # Command Prompt needs ANSI enabled via SetConsoleMode
+        # Command Prompt needs ANSI enabled via SetConsoleMode, but may not support it
         
         # Check if we're in a modern terminal that likely supports ANSI
         term_program = os.environ.get('TERM_PROGRAM', '').lower()
@@ -140,31 +140,29 @@ def _init_display_coordinator():
         is_warp = 'warp' in term_program
         is_windows_terminal = bool(term_emulator)
         
-        # Modern terminals likely support ANSI - try to enable it anyway
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            # Enable VT100 escape sequences for Windows 10+
-            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            hOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-            mode = ctypes.wintypes.DWORD()
-            if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
-                # Assume it worked if SetConsoleMode succeeded
-                _ansi_supported = True
-            elif is_warp or is_windows_terminal:
-                # Modern terminal but SetConsoleMode failed - still try ANSI
-                # These terminals should support ANSI natively
-                _ansi_supported = True
-        except (ImportError, OSError, AttributeError):
-            # If SetConsoleMode fails but we're in a modern terminal, try ANSI anyway
-            if is_warp or is_windows_terminal:
-                _ansi_supported = True
-            else:
-                # Command Prompt without ANSI support - but try anyway
-                # Many Windows terminals support ANSI even if SetConsoleMode fails
-                # We'll test if it actually works in practice
-                _ansi_supported = True  # Try ANSI by default, fallback to scrolling if it doesn't work
+        # If we're in a known modern terminal, assume ANSI works
+        if is_warp or is_windows_terminal:
+            _ansi_supported = True
+        else:
+            # Command Prompt or unknown terminal - try to enable ANSI
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                # Enable VT100 escape sequences for Windows 10+
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                hOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+                mode = ctypes.wintypes.DWORD()
+                if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
+                    # Try to enable ANSI
+                    if kernel32.SetConsoleMode(hOut, mode.value | 0x0004):
+                        # Successfully enabled - verify it works by checking if mode was set
+                        new_mode = ctypes.wintypes.DWORD()
+                        if kernel32.GetConsoleMode(hOut, ctypes.byref(new_mode)):
+                            if new_mode.value & 0x0004:
+                                _ansi_supported = True
+            except (ImportError, OSError, AttributeError):
+                # Can't enable ANSI - will use fallback
+                _ansi_supported = False
     
     _display_initialized = True
 
@@ -190,7 +188,7 @@ def _print_to_thread_line(thread_id, message):
     # Calculate absolute line position from bottom (0 = bottom line)
     # Use simpler ANSI codes that work better on Windows
     with _display_lock:
-        if _ansi_supported or not _is_windows:
+        if _ansi_supported:
             # Use line-based positioning: move to specific line number
             # Calculate line number from top: results_area_height + thread_line_position
             # Thread lines start after results area, so line number = _results_area_height + line_pos
@@ -204,14 +202,10 @@ def _print_to_thread_line(thread_id, message):
             print('\033[K', end='', flush=True)  # Clear to end of line
             print(message, end='', flush=True)
         else:
-            # Windows without ANSI support: use carriage return for single-line updates
-            # This provides basic in-place updates without full ANSI support
-            if '\n' not in message:
-                # Single line: use carriage return to overwrite
-                print(f'\r{message}', end='', flush=True)
-            else:
-                # Multi-line: print normally (will scroll)
-                print(message, flush=True)
+            # Windows Command Prompt without ANSI support: use simple scrolling output
+            # Print with newline - will scroll, but is readable and functional
+            # No ANSI escape codes are used here
+            print(message, flush=True)
 
 def status_display_manager():
     """
@@ -326,9 +320,11 @@ def start_status_display():
             for _ in range(_max_thread_lines):
                 print()  # Print blank line
             # Move cursor back up to top of reserved area
-            if _ansi_supported or not _is_windows:
+            if _ansi_supported:
                 for _ in range(_max_thread_lines):
                     print('\033[A', end='')  # Move up
+            # For Windows without ANSI, cursor will be at bottom after printing blank lines
+            # This is fine - thread status will print below naturally
         
         _status_display_active = True
         _status_display_thread = threading.Thread(target=status_display_manager, daemon=True)
@@ -2380,7 +2376,7 @@ def print_top_results(results, top_n=5, total_votes=None):
     
     # Print results in fixed area (top of screen)
     with _display_lock:
-        if _ansi_supported or not _is_windows:
+        if _ansi_supported:
             # Move to top-left corner
             print('\033[H', end='', flush=True)
             
@@ -2394,8 +2390,9 @@ def print_top_results(results, top_n=5, total_votes=None):
                     # Clear remaining blank lines (print newline to move down)
                     print(flush=True)
         else:
-            # Windows without ANSI support: print normally (results will appear above threads)
-            # Fixed positioning not available, but output is still readable
+            # Windows Command Prompt without ANSI support: print normally
+            # Results will appear above threads, but will scroll
+            # No ANSI escape codes are used here - just plain text
             for line in result_lines:
                 print(line, flush=True)
     
