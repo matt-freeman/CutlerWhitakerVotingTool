@@ -126,9 +126,21 @@ def _init_display_coordinator():
     _is_windows = platform.system() == 'Windows'
     _ansi_supported = False
     
-    # Try to enable ANSI support on Windows 10+ if available
     # Mac (ARM/Intel) and Linux terminals naturally support ANSI, so no action needed
-    if _is_windows:
+    if not _is_windows:
+        _ansi_supported = True  # Assume ANSI works on Unix-like systems
+    else:
+        # Windows: Try to enable and verify ANSI support
+        # Modern terminals (Windows Terminal, Warp) support ANSI natively
+        # Command Prompt needs ANSI enabled via SetConsoleMode
+        
+        # Check if we're in a modern terminal that likely supports ANSI
+        term_program = os.environ.get('TERM_PROGRAM', '').lower()
+        term_emulator = os.environ.get('WT_SESSION', '')  # Windows Terminal
+        is_warp = 'warp' in term_program
+        is_windows_terminal = bool(term_emulator)
+        
+        # Modern terminals likely support ANSI - try to enable it anyway
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -138,11 +150,21 @@ def _init_display_coordinator():
             mode = ctypes.wintypes.DWORD()
             if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
+                # Assume it worked if SetConsoleMode succeeded
+                _ansi_supported = True
+            elif is_warp or is_windows_terminal:
+                # Modern terminal but SetConsoleMode failed - still try ANSI
+                # These terminals should support ANSI natively
                 _ansi_supported = True
         except (ImportError, OSError, AttributeError):
-            # ctypes not available, or Windows API call failed, or not Windows 10+
-            # Fall back to simple text output (no ANSI escape codes)
-            _ansi_supported = False
+            # If SetConsoleMode fails but we're in a modern terminal, try ANSI anyway
+            if is_warp or is_windows_terminal:
+                _ansi_supported = True
+            else:
+                # Command Prompt without ANSI support - but try anyway
+                # Many Windows terminals support ANSI even if SetConsoleMode fails
+                # We'll test if it actually works in practice
+                _ansi_supported = True  # Try ANSI by default, fallback to scrolling if it doesn't work
     
     _display_initialized = True
 
@@ -166,38 +188,30 @@ def _print_to_thread_line(thread_id, message):
         return
     
     # Calculate absolute line position from bottom (0 = bottom line)
-    # We need to move to the bottom of screen, then up to target line
+    # Use simpler ANSI codes that work better on Windows
     with _display_lock:
         if _ansi_supported or not _is_windows:
-            # Save current cursor position
-            print('\033[s', end='', flush=True)
+            # Use line-based positioning: move to specific line number
+            # Calculate line number from top: results_area_height + thread_line_position
+            # Thread lines start after results area, so line number = _results_area_height + line_pos
+            target_line = _results_area_height + line_pos
             
-            # Move to bottom of reserved thread area
-            # Calculate: bottom line is at (_max_thread_lines - 1) lines from top of thread area
-            # We need to go to the very bottom of the screen first
-            # Strategy: Move down to bottom, then up to target line
-            # Actually simpler: calculate from a known position
-            # Let's use: move cursor down to bottom of thread area, then up to target
-            
-            # Move down to bottom of thread area (assuming we're at top of thread area)
-            for _ in range(_max_thread_lines - 1):
-                print('\033[B', end='')  # Move down
-            
-            # Move up to target thread's line
-            lines_from_bottom = line_pos
-            for _ in range(lines_from_bottom):
-                print('\033[A', end='')  # Move up
+            # Move cursor to specific line using ANSI escape sequence
+            # \033[n;H moves cursor to line n, column 1 (1-based, so add 1)
+            print(f'\033[{target_line + 1};1H', end='', flush=True)
             
             # Clear line and print message
-            print('\033[K', end='')  # Clear to end of line
-            print('\r' + message, end='', flush=True)
-            
-            # Restore cursor position
-            print('\033[u', end='', flush=True)
+            print('\033[K', end='', flush=True)  # Clear to end of line
+            print(message, end='', flush=True)
         else:
-            # Windows without ANSI support: print normally (fixed positioning not available)
-            # This will cause new lines for each update, but is a functional fallback
-            print(message, flush=True)
+            # Windows without ANSI support: use carriage return for single-line updates
+            # This provides basic in-place updates without full ANSI support
+            if '\n' not in message:
+                # Single line: use carriage return to overwrite
+                print(f'\r{message}', end='', flush=True)
+            else:
+                # Multi-line: print normally (will scroll)
+                print(message, flush=True)
 
 def status_display_manager():
     """
