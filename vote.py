@@ -2571,6 +2571,7 @@ def perform_vote_iteration(thread_id="Main"):
     """
     global vote_count, consecutive_behind_count, standard_vote_count
     global initial_accelerated_vote_count, accelerated_vote_count, super_accelerated_vote_count
+    global _last_verification_vote_count, _first_vote_completed
     
     # Track vote duration for performance monitoring
     vote_iteration_start = time.time()
@@ -2616,11 +2617,29 @@ def perform_vote_iteration(thread_id="Main"):
             
             results, total_votes = extract_voting_results(result_html)
             if results:
-                if thread_id == "Main":  # Only main thread prints results to avoid clutter
+                cutler_ahead = is_cutler_ahead(results)
+                
+                # Check if verification will happen (before printing results)
+                # This ensures we print results AFTER verification updates the display
+                # Use the same logic as the actual verification check below
+                will_verify = False
+                with _counter_lock:
+                    # Check if we've reached or passed the next verification threshold
+                    if vote_count == 1:
+                        if _last_verification_vote_count < 1:
+                            will_verify = True
+                    else:
+                        next_threshold = ((_last_verification_vote_count // 500) + 1) * 500
+                        if _last_verification_vote_count == 0:
+                            next_threshold = 500
+                        if vote_count >= next_threshold:
+                            will_verify = True
+                
+                # Only print results now if verification won't happen
+                # (verification will print results after updating verification info)
+                if thread_id == "Main" and not will_verify:
                     # Print results (includes verification info if available)
                     print_top_results(results, top_n=5, total_votes=total_votes)
-                
-                cutler_ahead = is_cutler_ahead(results)
                 
                 # Update consecutive behind counter for adaptive timing (thread-safe)
                 with _counter_lock:
@@ -2732,47 +2751,68 @@ def perform_vote_iteration(thread_id="Main"):
     )
     
     # Check if we should perform vote verification
-    # Only main thread performs verification (to avoid race conditions)
     # Verification is triggered: after first vote, then every 500 votes
-    # We check the GLOBAL vote_count (not current_vote_num) to catch thresholds hit by any thread
-    global _last_verification_vote_count, _first_vote_completed
-    if thread_id == "Main":
-        # Mark first vote as completed
-        if not _first_vote_completed:
-            _first_vote_completed = True
-        
-        should_verify = False
-        # Check the global vote_count (which includes votes from all threads)
-        # This ensures we catch verification thresholds even if parallel threads hit them
-        with _counter_lock:
-            # Check if global vote_count is a multiple of 500 (or first vote)
-            # This catches thresholds regardless of which thread hit them
-            if vote_count == 1 or (vote_count % 500 == 0):
-                # Double-check we haven't already verified this vote count
-                if vote_count != _last_verification_vote_count:
-                    should_verify = True
-                    # Update last verification count immediately to prevent duplicate checks
-                    _last_verification_vote_count = vote_count
-        
-        # Perform verification if needed (only on successful votes with results)
-        if should_verify and success and results and total_votes is not None:
-            # Find Cutler's percentage from results
-            cutler_percentage = None
-            for name, percentage in results:
-                name_lower = name.lower()
-                if 'cutler' in name_lower and 'whitaker' in name_lower:
-                    cutler_percentage = percentage
-                    break
+    # Any thread can perform verification (log_vote_verification is thread-safe)
+    # Display updates are handled separately by Main thread
+    
+    # Mark first vote as completed (only needed once)
+    if thread_id == "Main" and not _first_vote_completed:
+        _first_vote_completed = True
+    
+    # Check if we've reached or passed the next verification threshold
+    # Verification happens at: 1, 500, 1000, 1500, etc.
+    should_verify = False
+    with _counter_lock:
+        if vote_count == 1:
+            # First vote - always verify
+            if _last_verification_vote_count < 1:
+                should_verify = True
+                _last_verification_vote_count = 1
+        else:
+            # Calculate the next threshold we should have verified
+            # If last verified was 0, next is 500; if 500, next is 1000, etc.
+            next_threshold = ((_last_verification_vote_count // 500) + 1) * 500
+            if _last_verification_vote_count == 0:
+                next_threshold = 500  # First threshold after vote 1
             
-            if cutler_percentage is not None:
-                # Log verification to file and update display
-                # Use global vote_count (not current_vote_num) to reflect total votes from all threads
-                with _counter_lock:
-                    global_vote_count = vote_count
-                log_vote_verification(global_vote_count, total_votes, cutler_percentage, results)
+            # If we've reached or passed the next threshold, verify
+            if vote_count >= next_threshold:
+                should_verify = True
+                # Mark this threshold as detected (use the actual threshold, not current vote_count)
+                # This prevents duplicate verifications if multiple threads check simultaneously
+                _last_verification_vote_count = next_threshold
+    
+    # Perform verification if threshold was detected and we have successful results
+    # Any thread can do this - log_vote_verification is thread-safe
+    if should_verify and success and results and total_votes is not None:
+        # Find Cutler's percentage from results
+        cutler_percentage = None
+        for name, percentage in results:
+            name_lower = name.lower()
+            if 'cutler' in name_lower and 'whitaker' in name_lower:
+                cutler_percentage = percentage
+                break
+        
+        if cutler_percentage is not None:
+            # Log verification to file (thread-safe)
+            # Use global vote_count (not current_vote_num) to reflect total votes from all threads
+            with _counter_lock:
+                global_vote_count = vote_count
+            log_vote_verification(global_vote_count, total_votes, cutler_percentage, results)
+            
+            # Update display with new verification info
+            # If Main thread: update immediately with its results
+            # If parallel thread: Main thread will pick it up on next print, but we can try to use these results if available
+            if thread_id == "Main":
                 # Refresh the display to show updated verification info immediately
-                # Re-print results with new verification info
                 print_top_results(results, top_n=5, total_votes=total_votes)
+            # Note: If a parallel thread did verification, Main thread will show updated info
+            # on its next successful vote when it calls print_top_results() (line 2642 or 2811)
+            # The _verification_info_lines global variable is shared, so Main thread will see the update
+    elif thread_id == "Main" and success and results and total_votes is not None:
+        # If verification didn't happen but we have results, print them now
+        # (Main thread handles all display updates)
+        print_top_results(results, top_n=5, total_votes=total_votes)
     
     return success, results, cutler_ahead
 
