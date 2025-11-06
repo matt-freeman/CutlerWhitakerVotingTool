@@ -81,6 +81,8 @@ _max_thread_lines = 0  # Maximum number of thread lines to reserve at bottom
 _results_area_start = 0  # Starting line number for results area (0 = top)
 _results_area_height = 22  # Number of lines reserved for results display (includes top 5 results + verification info + separator)
 _verification_info_lines = []  # Store current verification info to display in fixed area
+_error_message_lines = []  # Store error/warning messages to display below thread status
+_error_area_height = 3  # Number of lines reserved for error messages below threads
 _display_lock = threading.Lock()  # Lock for all display operations
 _display_initialized = False  # Flag to track if display has been initialized
 _is_windows = platform.system() == 'Windows'
@@ -313,15 +315,17 @@ def start_status_display():
         _init_display_coordinator()
     
     if not _status_display_active:
-        # Reserve space at bottom for thread lines
+        # Reserve space at bottom for thread lines and error area
         # Print blank lines to create the reserved area
-        if _max_thread_lines > 0:
+        global _error_area_height
+        total_reserved_lines = _max_thread_lines + _error_area_height
+        if total_reserved_lines > 0:
             # Move cursor to bottom and reserve space
-            for _ in range(_max_thread_lines):
+            for _ in range(total_reserved_lines):
                 print()  # Print blank line
             # Move cursor back up to top of reserved area
             if _ansi_supported:
-                for _ in range(_max_thread_lines):
+                for _ in range(total_reserved_lines):
                     print('\033[A', end='')  # Move up
             # For Windows without ANSI, cursor will be at bottom after printing blank lines
             # This is fine - thread status will print below naturally
@@ -330,14 +334,70 @@ def start_status_display():
         _status_display_thread = threading.Thread(target=status_display_manager, daemon=True)
         _status_display_thread.start()
 
+def display_error_message(message, thread_id=None):
+    """
+    Display an error or warning message in a fixed area below thread status.
+    
+    Args:
+        message (str): Error/warning message to display
+        thread_id (str, optional): Thread identifier if message is thread-specific
+    """
+    global _error_message_lines, _error_area_height, _max_thread_lines, _results_area_height
+    global _ansi_supported, _is_windows, _display_initialized
+    
+    if not _display_initialized:
+        _init_display_coordinator()
+    
+    # Add message to error lines (keep last N messages)
+    timestamp = datetime.now().strftime('[%H:%M:%S]')
+    if thread_id:
+        error_line = f"{timestamp} [{thread_id}] ⚠ {message}"
+    else:
+        error_line = f"{timestamp} ⚠ {message}"
+    
+    with _display_lock:
+        _error_message_lines.append(error_line)
+        # Keep only the last N messages (based on error area height)
+        if len(_error_message_lines) > _error_area_height:
+            _error_message_lines = _error_message_lines[-_error_area_height:]
+        
+        # Display error messages in fixed area below threads
+        if _ansi_supported:
+            # Calculate line number: results_area_height + max_thread_lines + error_line_index
+            error_start_line = _results_area_height + _max_thread_lines + 1
+            
+            # Always display/clear all error area lines (even if fewer messages)
+            for i in range(_error_area_height):
+                target_line = error_start_line + i
+                # Move to error line
+                print(f'\033[{target_line + 1};1H', end='', flush=True)
+                # Clear line
+                print('\033[K', end='', flush=True)
+                # Print error message if available
+                if i < len(_error_message_lines[-_error_area_height:]):
+                    print(_error_message_lines[-_error_area_height:][i], end='', flush=True)
+        else:
+            # Windows without ANSI: print error messages (will scroll, but better than nothing)
+            for error_line in _error_message_lines[-_error_area_height:]:
+                print(error_line, flush=True)
+
 def stop_status_display():
-    """Stop the centralized status display thread."""
-    global _status_display_active
+    """Stop the centralized status display thread and wait for it to finish."""
+    global _status_display_active, _status_display_thread
     _status_display_active = False
     with _status_lock:
         _thread_status.clear()
-    # Clear the status display area
-    print('\r' + ' ' * 80 + '\r', end='', flush=True)
+    # Wait for display thread to finish (with timeout)
+    if _status_display_thread and _status_display_thread.is_alive():
+        _status_display_thread.join(timeout=0.5)
+    # Don't clear screen - we want to preserve the displayed results
+    # Just ensure we're ready for normal printing
+    if _ansi_supported:
+        # Move cursor to a new line below the reserved area to avoid overwriting
+        # Calculate where the reserved area ends
+        total_reserved = _results_area_height + _max_thread_lines + _error_area_height
+        print(f'\033[{total_reserved + 2};1H', end='', flush=True)
+    # For non-ANSI terminals, cursor will naturally be at the bottom
 
 def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ahead, 
                      consecutive_behind_count, vote_type, lead_percentage=None, is_backoff_vote=False, 
@@ -1513,15 +1573,17 @@ def submit_vote_selenium():
         
         if not vote_button:
             # Last resort: Save page source and try to find by inspecting DOM
-            print("Could not find vote button using standard strategies.")
-            print("Saving page source for manual inspection...")
+            # Use error message display instead of direct print
+            display_error_message("Could not find vote button using standard strategies.")
+            display_error_message("Saving page source for manual inspection...")
             with open('page_source.html', 'w', encoding='utf-8') as f:
                 f.write(driver.page_source)
             
             # Try to find any interactive element near text containing the name
             try:
                 text_elements = driver.find_elements(By.XPATH, f"//*[contains(text(), 'Cutler') or contains(text(), 'Whitaker')]")
-                print(f"Found {len(text_elements)} text elements containing 'Cutler' or 'Whitaker'")
+                if text_elements:
+                    display_error_message(f"Found {len(text_elements)} text elements containing 'Cutler' or 'Whitaker'")
                 for text_elem in text_elements:
                     try:
                         # Look for nearby button or clickable element
@@ -1917,7 +1979,7 @@ def submit_vote_selenium():
                 # Note: Performance timing and driver.quit() are now handled in finally block for guaranteed execution
                 return True
             except Exception as e:
-                print(f"Error clicking button: {e}")
+                display_error_message(f"Error clicking button: {e}")
                 # Try JavaScript click as fallback
                 try:
                     # Save the initial page state for comparison
@@ -2027,10 +2089,11 @@ def submit_vote_selenium():
                     # Note: Performance timing and driver.quit() are now handled in finally block for guaranteed execution
                     return True
                 except Exception as e2:
-                    print(f"JavaScript click also failed: {e2}")
+                    display_error_message(f"JavaScript click also failed: {e2}")
         else:
-            print("Could not locate vote button for Cutler Whitaker")
-            print("Page source saved to page_source.html for manual inspection")
+            # Use error message display instead of direct print
+            display_error_message("Could not locate vote button for Cutler Whitaker")
+            display_error_message("Page source saved to page_source.html for manual inspection")
         
         # Switch back to default content if we were in an iframe
         if in_iframe and driver is not None:
@@ -2043,9 +2106,10 @@ def submit_vote_selenium():
         return False
             
     except Exception as e:
-        print(f"Selenium error: {e}")
-        import traceback
-        traceback.print_exc()
+        display_error_message(f"Selenium error: {e}")
+        if debug_mode:
+            import traceback
+            traceback.print_exc()
         return False
     
     finally:
@@ -2298,9 +2362,10 @@ def extract_voting_results(html_content):
             debug_print(f"Could not extract total votes: {e}")
         
     except Exception as e:
-        print(f"Error extracting results: {e}")
-        import traceback
-        traceback.print_exc()
+        display_error_message(f"Error extracting results: {e}")
+        if debug_mode:
+            import traceback
+            traceback.print_exc()
         return [], None
     
     return unique_results, total_votes
@@ -2482,7 +2547,8 @@ def signal_handler(sig, frame):
         frame: Current stack frame (unused, required by signal handler signature)
     """
     global shutdown_flag
-    print("\n\n⚠ Interrupt received (Ctrl+C). Gracefully shutting down...")
+    # Don't print here - let the finally block handle all output after display is stopped
+    # This prevents interference with the fixed display
     shutdown_flag = True
     # Don't call sys.exit() here - let the main loop's finally block handle cleanup
     # This ensures statistics are displayed and threads are properly shut down
@@ -2668,6 +2734,7 @@ def perform_vote_iteration(thread_id="Main"):
     # Check if we should perform vote verification
     # Only main thread performs verification (to avoid race conditions)
     # Verification is triggered: after first vote, then every 500 votes
+    # We check the GLOBAL vote_count (not current_vote_num) to catch thresholds hit by any thread
     global _last_verification_vote_count, _first_vote_completed
     if thread_id == "Main":
         # Mark first vote as completed
@@ -2675,18 +2742,17 @@ def perform_vote_iteration(thread_id="Main"):
             _first_vote_completed = True
         
         should_verify = False
-        # Use current_vote_num (captured at start of this iteration) for consistency
-        # This ensures we're checking the vote number for this specific vote iteration
+        # Check the global vote_count (which includes votes from all threads)
+        # This ensures we catch verification thresholds even if parallel threads hit them
         with _counter_lock:
-            # Use modulo to check if current_vote_num is a multiple of 500 (or first vote)
-            # Only the main thread with current_vote_num % 500 == 0 (or vote #1) should verify
-            # This prevents multiple threads from trying to update the file simultaneously
-            if current_vote_num == 1 or (current_vote_num % 500 == 0):
+            # Check if global vote_count is a multiple of 500 (or first vote)
+            # This catches thresholds regardless of which thread hit them
+            if vote_count == 1 or (vote_count % 500 == 0):
                 # Double-check we haven't already verified this vote count
-                if current_vote_num != _last_verification_vote_count:
+                if vote_count != _last_verification_vote_count:
                     should_verify = True
                     # Update last verification count immediately to prevent duplicate checks
-                    _last_verification_vote_count = current_vote_num
+                    _last_verification_vote_count = vote_count
         
         # Perform verification if needed (only on successful votes with results)
         if should_verify and success and results and total_votes is not None:
@@ -2700,7 +2766,10 @@ def perform_vote_iteration(thread_id="Main"):
             
             if cutler_percentage is not None:
                 # Log verification to file and update display
-                log_vote_verification(current_vote_num, total_votes, cutler_percentage, results)
+                # Use global vote_count (not current_vote_num) to reflect total votes from all threads
+                with _counter_lock:
+                    global_vote_count = vote_count
+                log_vote_verification(global_vote_count, total_votes, cutler_percentage, results)
                 # Refresh the display to show updated verification info immediately
                 # Re-print results with new verification info
                 print_top_results(results, top_n=5, total_votes=total_votes)
@@ -3221,8 +3290,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        # Stop status display
+        # Stop status display FIRST to prevent interference with final output
         stop_status_display()
+        
+        # Small delay to ensure display thread has fully stopped
+        time.sleep(0.1)
         
         # Stop all parallel voting threads if they're running
         with _parallel_voting_lock:
@@ -3233,7 +3305,13 @@ def main():
         for i in range(len(_parallel_threads)):
             if _parallel_threads[i] and _parallel_threads[i].is_alive():
                 thread_name = f"Parallel-{i + 1}"
-                print(f"\n⏹ Waiting for {thread_name} to stop...")
+                # Use display_error_message for consistency, but it may not display if display is stopped
+                # So we'll print directly after display is stopped
+                pass  # Silently wait - don't print here to avoid interference
+        
+        # Wait for all threads with timeout
+        for i in range(len(_parallel_threads)):
+            if _parallel_threads[i] and _parallel_threads[i].is_alive():
                 _parallel_threads[i].join(timeout=5)
         
         # Thread-safe read of all counters for final statistics
@@ -3244,6 +3322,7 @@ def main():
             final_accelerated_count = accelerated_vote_count
             final_super_accelerated_count = super_accelerated_vote_count
         
+        # Now print final summary - display is stopped, so normal printing is safe
         print(f"\n{'='*60}")
         print(f"Voting session ended")
         print(f"{'='*60}")
