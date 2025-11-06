@@ -127,6 +127,7 @@ def _init_display_coordinator():
     _ansi_supported = False
     
     # Try to enable ANSI support on Windows 10+ if available
+    # Mac (ARM/Intel) and Linux terminals naturally support ANSI, so no action needed
     if _is_windows:
         try:
             import ctypes
@@ -138,7 +139,9 @@ def _init_display_coordinator():
             if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
                 _ansi_supported = True
-        except:
+        except (ImportError, OSError, AttributeError):
+            # ctypes not available, or Windows API call failed, or not Windows 10+
+            # Fall back to simple text output (no ANSI escape codes)
             _ansi_supported = False
     
     _display_initialized = True
@@ -192,7 +195,8 @@ def _print_to_thread_line(thread_id, message):
             # Restore cursor position
             print('\033[u', end='', flush=True)
         else:
-            # Windows without ANSI: just print (can't do fixed positioning easily)
+            # Windows without ANSI support: print normally (fixed positioning not available)
+            # This will cause new lines for each update, but is a functional fallback
             print(message, flush=True)
 
 def status_display_manager():
@@ -2376,7 +2380,8 @@ def print_top_results(results, top_n=5, total_votes=None):
                     # Clear remaining blank lines (print newline to move down)
                     print(flush=True)
         else:
-            # Windows without ANSI: just print (results will appear above threads)
+            # Windows without ANSI support: print normally (results will appear above threads)
+            # Fixed positioning not available, but output is still readable
             for line in result_lines:
                 print(line, flush=True)
     
