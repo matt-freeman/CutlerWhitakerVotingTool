@@ -79,7 +79,8 @@ _parallel_voting_lock = threading.Lock()  # Lock for parallel voting control var
 _thread_line_map = {}  # Dictionary: thread_id -> line_number (0 = bottom thread line)
 _max_thread_lines = 0  # Maximum number of thread lines to reserve at bottom
 _results_area_start = 0  # Starting line number for results area (0 = top)
-_results_area_height = 9  # Number of lines reserved for results display (reduced to bring closer to threads)
+_results_area_height = 22  # Number of lines reserved for results display (includes top 5 results + verification info + separator)
+_verification_info_lines = []  # Store current verification info to display in fixed area
 _display_lock = threading.Lock()  # Lock for all display operations
 _display_initialized = False  # Flag to track if display has been initialized
 _is_windows = platform.system() == 'Windows'
@@ -111,6 +112,12 @@ _json_log_lock = threading.Lock()  # Lock for thread-safe JSON file writes
 _current_session_id = None  # Unique session identifier for this run
 _save_top_results = False  # Whether to save top_5_results in JSON (default: False to keep file size down)
 _force_parallel_mode = False  # Whether to force parallel threads to stay active (default: False)
+
+# Vote verification tracking
+VOTE_VERIFICATION_FILE = 'vote_verification.json'  # File to track vote effectiveness
+_verification_log_lock = threading.Lock()  # Lock for thread-safe verification file writes
+_last_verification_vote_count = 0  # Track last vote count when we did verification
+_first_vote_completed = False  # Flag to track when main thread's first vote completes
 
 def _init_display_coordinator():
     """Initialize the display coordinator with ANSI support detection."""
@@ -595,6 +602,191 @@ def log_vote_to_json(vote_num, thread_id, timestamp, success, results, cutler_ah
             debug_print(f"⚠ Error writing to JSON log: {e}")
             import traceback
             debug_print(traceback.format_exc())
+
+def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
+    """
+    Log vote verification data to track vote effectiveness.
+    
+    This function calculates Cutler's actual vote count from the total votes and
+    his percentage, then records this data to a JSON file. This helps track whether
+    votes are being counted by the server or silently rejected.
+    
+    Verification is triggered:
+    - After the first vote is cast (main thread only)
+    - Every 500 votes thereafter
+    
+    The JSON file structure:
+    {
+        "verification_records": [
+            {
+                "timestamp": "YYYY-MM-DD HH:MM:SS",
+                "session_id": str,
+                "our_vote_count": int,  # Number of votes we've attempted
+                "total_votes_on_server": int,  # Total votes shown on server
+                "cutler_percentage": float,  # Cutler's percentage from results
+                "cutler_vote_count_calculated": int,  # total_votes * (cutler_percentage / 100)
+                "cutler_position": int,  # Cutler's position (1-based)
+                "expected_vote_increase": int,  # How many votes we expected Cutler to have gained
+                "actual_vote_increase": int or null  # How many votes Cutler actually gained (calculated from previous record)
+                "effectiveness_percentage": float or null  # (actual_increase / expected_increase * 100)
+            },
+            ...
+        ]
+    }
+    
+    Args:
+        vote_count (int): Current vote count (number of votes we've attempted)
+        total_votes (int or None): Total votes shown on the server results page
+        cutler_percentage (float or None): Cutler's percentage from the results
+        results (list or None): List of (athlete_name, percentage) tuples from results page
+    
+    Returns:
+        None: This function only writes to file
+    
+    Thread Safety:
+        This function is thread-safe using _verification_log_lock.
+    """
+    global VOTE_VERIFICATION_FILE, _verification_log_lock, _current_session_id
+    
+    # Only proceed if we have valid data
+    if total_votes is None or cutler_percentage is None or results is None:
+        return
+    
+    # Calculate Cutler's vote count from percentage
+    cutler_vote_count = int(total_votes * (cutler_percentage / 100.0))
+    
+    # Find Cutler's position
+    cutler_position = None
+    for idx, (name, pct) in enumerate(results, 1):
+        name_lower = name.lower()
+        if 'cutler' in name_lower and 'whitaker' in name_lower:
+            cutler_position = idx
+            break
+    
+    # Get timestamp
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Session ID should already be initialized in main()
+    if _current_session_id is None:
+        _current_session_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    
+    # Build verification record
+    verification_record = {
+        "timestamp": timestamp,
+        "session_id": _current_session_id,
+        "our_vote_count": vote_count,
+        "total_votes_on_server": total_votes,
+        "cutler_percentage": round(cutler_percentage, 2),
+        "cutler_vote_count_calculated": cutler_vote_count,
+        "cutler_position": cutler_position,
+    }
+    
+    # Thread-safe JSON file write
+    with _verification_log_lock:
+        try:
+            # Try to read existing file
+            try:
+                with open(VOTE_VERIFICATION_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Ensure verification_records exists
+                if "verification_records" not in data:
+                    data["verification_records"] = []
+                
+                # Get previous record to calculate vote increase
+                previous_record = None
+                if len(data["verification_records"]) > 0:
+                    previous_record = data["verification_records"][-1]
+                
+                # Calculate expected and actual vote increases
+                if previous_record:
+                    previous_our_votes = previous_record.get("our_vote_count", 0)
+                    previous_cutler_votes = previous_record.get("cutler_vote_count_calculated", 0)
+                    
+                    expected_increase = vote_count - previous_our_votes
+                    actual_increase = cutler_vote_count - previous_cutler_votes
+                    
+                    verification_record["expected_vote_increase"] = expected_increase
+                    verification_record["actual_vote_increase"] = actual_increase
+                    
+                    # Calculate effectiveness (if we expected 500 votes, did Cutler's count increase by close to 500?)
+                    if expected_increase > 0:
+                        effectiveness = (actual_increase / expected_increase * 100) if expected_increase > 0 else 0
+                        verification_record["effectiveness_percentage"] = round(effectiveness, 2)
+                    else:
+                        verification_record["effectiveness_percentage"] = None
+                else:
+                    # First record - no previous data to compare
+                    verification_record["expected_vote_increase"] = vote_count
+                    verification_record["actual_vote_increase"] = None
+                    verification_record["effectiveness_percentage"] = None
+                
+            except (FileNotFoundError, json.JSONDecodeError):
+                # File doesn't exist or is corrupted - create new structure
+                data = {
+                    "verification_records": []
+                }
+                # First record
+                verification_record["expected_vote_increase"] = vote_count
+                verification_record["actual_vote_increase"] = None
+                verification_record["effectiveness_percentage"] = None
+            
+            # Append new verification record
+            data["verification_records"].append(verification_record)
+            
+            # Write back to file
+            with open(VOTE_VERIFICATION_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            # Build verification info lines for fixed display
+            global _verification_info_lines
+            _verification_info_lines = []
+            _verification_info_lines.append(f"VOTE VERIFICATION CHECK #{len(data['verification_records'])}")
+            _verification_info_lines.append("=" * 60)
+            _verification_info_lines.append(f"Our vote count:           {vote_count}")
+            _verification_info_lines.append(f"Total votes on server:    {total_votes:,}")
+            _verification_info_lines.append(f"Cutler's percentage:      {cutler_percentage:.2f}%")
+            _verification_info_lines.append(f"Cutler's vote count:      {cutler_vote_count:,} (calculated)")
+            
+            if verification_record.get("actual_vote_increase") is not None:
+                expected = verification_record.get("expected_vote_increase", 0) or 0
+                actual = verification_record.get("actual_vote_increase", 0) or 0
+                effectiveness = verification_record.get("effectiveness_percentage")
+                _verification_info_lines.append("")
+                _verification_info_lines.append(f"Expected increase:        {expected:,} votes")
+                _verification_info_lines.append(f"Actual increase:          {actual:,} votes")
+                if effectiveness is not None:
+                    _verification_info_lines.append(f"Effectiveness:            {effectiveness:.1f}%")
+                    if effectiveness < 50:
+                        _verification_info_lines.append("⚠ WARNING: Low effectiveness - votes may be being rejected!")
+                    elif effectiveness < 80:
+                        _verification_info_lines.append("⚠ CAUTION: Some votes may not be counting")
+                    else:
+                        _verification_info_lines.append("✓ Good effectiveness - votes appear to be counting")
+                else:
+                    _verification_info_lines.append("Effectiveness:            N/A (first verification)")
+            else:
+                # First verification - no previous data
+                expected = verification_record.get("expected_vote_increase", vote_count)
+                _verification_info_lines.append("")
+                _verification_info_lines.append(f"Expected increase:        {expected:,} votes")
+                _verification_info_lines.append("Actual increase:          N/A (first verification)")
+                _verification_info_lines.append("Effectiveness:            N/A (first verification)")
+            
+            _verification_info_lines.append("=" * 60)
+            
+            # Update the fixed display with new verification info
+            # This will be printed the next time print_top_results is called
+            # For immediate update, we need to re-print the results area
+            # We'll trigger a refresh by calling print_top_results with current results if available
+            # But for now, the verification info will appear on the next results update
+            
+        except Exception as e:
+            # Log error but don't crash the voting process
+            print(f"⚠ Error writing to vote verification log: {e}")
+            if debug_mode:
+                import traceback
+                traceback.print_exc()
 
 def debug_print(*args, **kwargs):
     """
@@ -2103,6 +2295,7 @@ def print_top_results(results, top_n=5, total_votes=None):
     
     Displays athlete names and their vote percentages in a clean, readable format.
     The results are printed in a fixed area above all thread status lines.
+    Also includes verification info if available.
     
     Args:
         results (list): List of tuples containing (athlete_name, percentage) sorted by percentage
@@ -2113,10 +2306,7 @@ def print_top_results(results, top_n=5, total_votes=None):
         list: The results list passed in (for chaining), or None if no results
     """
     global _status_display_paused, _results_area_start, _results_area_height, _max_thread_lines
-    global _ansi_supported, _is_windows
-    
-    if not results:
-        return None
+    global _ansi_supported, _is_windows, _verification_info_lines
     
     if not _display_initialized:
         _init_display_coordinator()
@@ -2130,12 +2320,43 @@ def print_top_results(results, top_n=5, total_votes=None):
     result_lines = []
     result_lines.append("")  # Blank line to separate from startup command
     result_lines.append(f"TOP {min(top_n, len(results))} VOTING RESULTS:")
-    for i, (name, percentage) in enumerate(results[:top_n], 1):
-        result_lines.append(f"{i}. {name:<40} {percentage:>6.2f}%")
+    
+    if results:
+        for i, (name, percentage) in enumerate(results[:top_n], 1):
+            result_lines.append(f"{i}. {name:<40} {percentage:>6.2f}%")
+    else:
+        result_lines.append("(No results available)")
     
     if total_votes is not None:
         total_votes_formatted = f"{total_votes:,}"
         result_lines.append(f"Total Votes: {total_votes_formatted}")
+    
+    # Add separator before verification info
+    result_lines.append("")  # Blank line
+    result_lines.append("=" * 60)
+    
+    # Add verification info if available
+    if _verification_info_lines:
+        result_lines.extend(_verification_info_lines)
+    else:
+        # Reserve space for verification info (will be filled later)
+        # Use fixed number of lines to prevent layout shift
+        result_lines.append("VOTE VERIFICATION: (Waiting for first check...)")
+        result_lines.append("=" * 60)
+        result_lines.append("Our vote count:           (waiting...)")
+        result_lines.append("Total votes on server:    (waiting...)")
+        result_lines.append("Cutler's percentage:      (waiting...)")
+        result_lines.append("Cutler's vote count:      (waiting...)")
+        result_lines.append("")
+        result_lines.append("Expected increase:        (waiting...)")
+        result_lines.append("Actual increase:          (waiting...)")
+        result_lines.append("Effectiveness:            (waiting...)")
+        result_lines.append("=" * 60)
+    
+    # Add separator between results/verification and thread status
+    result_lines.append("")  # Blank line
+    result_lines.append("=" * 60)  # Separator line
+    result_lines.append("")  # Blank line
     
     # Print results in fixed area (top of screen)
     with _display_lock:
@@ -2294,6 +2515,7 @@ def perform_vote_iteration(thread_id="Main"):
     
     # Initialize variables that may be used in both success and failure paths
     results = None
+    total_votes = None  # Track total votes from server for verification
     cutler_ahead = False
     vote_type = "standard"  # Default vote type
     lead_percentage = None
@@ -2311,6 +2533,7 @@ def perform_vote_iteration(thread_id="Main"):
             results, total_votes = extract_voting_results(result_html)
             if results:
                 if thread_id == "Main":  # Only main thread prints results to avoid clutter
+                    # Print results (includes verification info if available)
                     print_top_results(results, top_n=5, total_votes=total_votes)
                 
                 cutler_ahead = is_cutler_ahead(results)
@@ -2423,6 +2646,43 @@ def perform_vote_iteration(thread_id="Main"):
         is_backoff_vote=is_backoff_active,
         vote_duration=vote_duration
     )
+    
+    # Check if we should perform vote verification
+    # Only main thread performs verification (to avoid race conditions)
+    # Verification is triggered: after first vote, then every 500 votes
+    global _last_verification_vote_count, _first_vote_completed
+    if thread_id == "Main":
+        # Mark first vote as completed
+        if not _first_vote_completed:
+            _first_vote_completed = True
+        
+        should_verify = False
+        with _counter_lock:
+            # Use modulo to check if vote_count is a multiple of 500 (or first vote)
+            # Only the main thread with vote_count % 500 == 0 (or vote #1) should verify
+            # This prevents multiple threads from trying to update the file simultaneously
+            if vote_count == 1 or (vote_count % 500 == 0):
+                # Double-check we haven't already verified this vote count
+                if vote_count != _last_verification_vote_count:
+                    should_verify = True
+                    # Update last verification count immediately to prevent duplicate checks
+                    _last_verification_vote_count = vote_count
+        
+        # Perform verification if needed (only on successful votes with results)
+        if should_verify and success and results and total_votes is not None:
+            # Find Cutler's percentage from results
+            cutler_percentage = None
+            for name, percentage in results:
+                name_lower = name.lower()
+                if 'cutler' in name_lower and 'whitaker' in name_lower:
+                    cutler_percentage = percentage
+                    break
+            
+            if cutler_percentage is not None:
+                log_vote_verification(vote_count, total_votes, cutler_percentage, results)
+                # Refresh the display to show updated verification info immediately
+                # Re-print results with new verification info
+                print_top_results(results, top_n=5, total_votes=total_votes)
     
     return success, results, cutler_ahead
 
@@ -2774,29 +3034,23 @@ def main():
     # Initialize session ID for JSON logging (unique per application run)
     # This prevents duplicate vote numbers from being confusing across restarts
     # Each restart gets a new session_id, but vote_number resets to 1 for each session
-    global _current_session_id
+    global _current_session_id, _first_vote_completed, _last_verification_vote_count
     if _current_session_id is None:
         session_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
         _current_session_id = f"{session_start_time}_{uuid.uuid4().hex[:8]}"
         debug_print(f"Session ID: {_current_session_id}")
     
+    # Reset vote verification tracking for new session
+    _first_vote_completed = False
+    _last_verification_vote_count = 0
+    
     # Start centralized status display
     start_status_display()
     
-    # If starting with multiple threads, initialize them now
-    if start_thread_count > 1:
-        num_parallel_threads = start_thread_count - 1  # Number of parallel threads to start
-        with _parallel_voting_lock:
-            for i in range(num_parallel_threads):
-                if i < len(_parallel_active):
-                    _parallel_active[i] = True
-                    # Create thread with proper closure to capture index
-                    # Use default parameter to capture the value at loop iteration time
-                    _parallel_threads[i] = threading.Thread(
-                        target=lambda idx=i: parallel_voting_thread(idx),
-                        daemon=True
-                    )
-                    _parallel_threads[i].start()
+    # Track if we should delay parallel thread startup
+    # Delay parallel threads until after main thread's first vote completes
+    # This ensures vote_verification.json is created by the main thread first
+    delay_parallel_startup = (start_thread_count > 1)
     
     try:
         # Main voting loop - continues until shutdown_flag is set (Ctrl+C)
@@ -2815,6 +3069,22 @@ def main():
             
             # Perform vote iteration
             success, results, cutler_ahead = perform_vote_iteration(thread_id="Main")
+            
+            # If we're delaying parallel thread startup, start them now after first vote completes
+            if delay_parallel_startup and _first_vote_completed:
+                delay_parallel_startup = False
+                num_parallel_threads = start_thread_count - 1  # Number of parallel threads to start
+                with _parallel_voting_lock:
+                    for i in range(num_parallel_threads):
+                        if i < len(_parallel_active):
+                            _parallel_active[i] = True
+                            # Create thread with proper closure to capture index
+                            # Use default parameter to capture the value at loop iteration time
+                            _parallel_threads[i] = threading.Thread(
+                                target=lambda idx=i: parallel_voting_thread(idx),
+                                daemon=True
+                            )
+                            _parallel_threads[i].start()
             
             # Check lead percentage and adjust backoff if needed
             lead_percentage = None
