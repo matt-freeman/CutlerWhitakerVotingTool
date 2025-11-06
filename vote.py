@@ -646,7 +646,7 @@ def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
     Thread Safety:
         This function is thread-safe using _verification_log_lock.
     """
-    global VOTE_VERIFICATION_FILE, _verification_log_lock, _current_session_id
+    global VOTE_VERIFICATION_FILE, _verification_log_lock, _current_session_id, _verification_info_lines
     
     # Only proceed if we have valid data
     if total_votes is None or cutler_percentage is None or results is None:
@@ -693,10 +693,15 @@ def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
                 if "verification_records" not in data:
                     data["verification_records"] = []
                 
-                # Get previous record to calculate vote increase
+                # Get previous record from CURRENT SESSION ONLY to calculate vote increase
+                # This prevents comparing against previous session's data
                 previous_record = None
                 if len(data["verification_records"]) > 0:
-                    previous_record = data["verification_records"][-1]
+                    # Find the most recent record from this session (search backwards)
+                    for record in reversed(data["verification_records"]):
+                        if record.get("session_id") == _current_session_id:
+                            previous_record = record
+                            break
                 
                 # Calculate expected and actual vote increases
                 if previous_record:
@@ -739,7 +744,6 @@ def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
                 json.dump(data, f, indent=2, ensure_ascii=False)
             
             # Build verification info lines for fixed display
-            global _verification_info_lines
             _verification_info_lines = []
             _verification_info_lines.append(f"VOTE VERIFICATION CHECK #{len(data['verification_records'])}")
             _verification_info_lines.append("=" * 60)
@@ -775,11 +779,7 @@ def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
             
             _verification_info_lines.append("=" * 60)
             
-            # Update the fixed display with new verification info
-            # This will be printed the next time print_top_results is called
-            # For immediate update, we need to re-print the results area
-            # We'll trigger a refresh by calling print_top_results with current results if available
-            # But for now, the verification info will appear on the next results update
+            # Verification info is now stored and will be displayed when print_top_results is called
             
         except Exception as e:
             # Log error but don't crash the voting process
@@ -787,6 +787,8 @@ def log_vote_verification(vote_count, total_votes, cutler_percentage, results):
             if debug_mode:
                 import traceback
                 traceback.print_exc()
+            # Clear verification info on error to prevent stale display
+            _verification_info_lines = []
 
 def debug_print(*args, **kwargs):
     """
@@ -2657,16 +2659,18 @@ def perform_vote_iteration(thread_id="Main"):
             _first_vote_completed = True
         
         should_verify = False
+        # Use current_vote_num (captured at start of this iteration) for consistency
+        # This ensures we're checking the vote number for this specific vote iteration
         with _counter_lock:
-            # Use modulo to check if vote_count is a multiple of 500 (or first vote)
-            # Only the main thread with vote_count % 500 == 0 (or vote #1) should verify
+            # Use modulo to check if current_vote_num is a multiple of 500 (or first vote)
+            # Only the main thread with current_vote_num % 500 == 0 (or vote #1) should verify
             # This prevents multiple threads from trying to update the file simultaneously
-            if vote_count == 1 or (vote_count % 500 == 0):
+            if current_vote_num == 1 or (current_vote_num % 500 == 0):
                 # Double-check we haven't already verified this vote count
-                if vote_count != _last_verification_vote_count:
+                if current_vote_num != _last_verification_vote_count:
                     should_verify = True
                     # Update last verification count immediately to prevent duplicate checks
-                    _last_verification_vote_count = vote_count
+                    _last_verification_vote_count = current_vote_num
         
         # Perform verification if needed (only on successful votes with results)
         if should_verify and success and results and total_votes is not None:
@@ -2679,7 +2683,8 @@ def perform_vote_iteration(thread_id="Main"):
                     break
             
             if cutler_percentage is not None:
-                log_vote_verification(vote_count, total_votes, cutler_percentage, results)
+                # Log verification to file and update display
+                log_vote_verification(current_vote_num, total_votes, cutler_percentage, results)
                 # Refresh the display to show updated verification info immediately
                 # Re-print results with new verification info
                 print_top_results(results, top_n=5, total_votes=total_votes)
