@@ -59,7 +59,10 @@ VOTE_INTERVAL = 60  # seconds between votes
 
 # Global flags
 shutdown_flag = False
+_shutting_down = False  # Flag to track if we're in shutdown mode (prevents error messages from overwriting final summary)
 debug_mode = False
+enhanced_anti_detection = False  # Enhanced anti-detection mode (slower but more realistic)
+use_headless = True  # Use headless mode (False = visible browser, less detectable)
 
 # Thread-safe lock for vote counters
 # This ensures thread-safe operations when incrementing vote counters
@@ -79,7 +82,7 @@ _parallel_voting_lock = threading.Lock()  # Lock for parallel voting control var
 _thread_line_map = {}  # Dictionary: thread_id -> line_number (0 = bottom thread line)
 _max_thread_lines = 0  # Maximum number of thread lines to reserve at bottom
 _results_area_start = 0  # Starting line number for results area (0 = top)
-_results_area_height = 22  # Number of lines reserved for results display (includes top 5 results + verification info + separator)
+_results_area_height = 28  # Number of lines reserved for results display (includes top 5 results + runtime + verification info + separators)
 _verification_info_lines = []  # Store current verification info to display in fixed area
 _error_message_lines = []  # Store error/warning messages to display below thread status
 _error_area_height = 3  # Number of lines reserved for error messages below threads
@@ -87,6 +90,7 @@ _display_lock = threading.Lock()  # Lock for all display operations
 _display_initialized = False  # Flag to track if display has been initialized
 _is_windows = platform.system() == 'Windows'
 _ansi_supported = False  # Will be set during initialization
+_debug_line_counter = 0  # Track current debug output line (for scrolling debug messages)
 
 # Centralized status display for all threads
 _thread_status = {}  # Dictionary: thread_id -> {'status': str, 'vote_num': int, 'spinner': str, 'message': str}
@@ -112,6 +116,7 @@ MAX_BACKOFF_DELAY = 300  # Maximum delay: 5 minutes (300 seconds)
 JSON_LOG_FILE = 'voting_activity.json'  # File to store vote activity summary
 _json_log_lock = threading.Lock()  # Lock for thread-safe JSON file writes
 _current_session_id = None  # Unique session identifier for this run
+_session_start_time = None  # Timestamp when the session started (for runtime calculation)
 _save_top_results = False  # Whether to save top_5_results in JSON (default: False to keep file size down)
 _force_parallel_mode = False  # Whether to force parallel threads to stay active (default: False)
 
@@ -343,7 +348,20 @@ def display_error_message(message, thread_id=None):
         thread_id (str, optional): Thread identifier if message is thread-specific
     """
     global _error_message_lines, _error_area_height, _max_thread_lines, _results_area_height
-    global _ansi_supported, _is_windows, _display_initialized
+    global _ansi_supported, _is_windows, _display_initialized, _shutting_down
+    
+    # During shutdown, suppress error messages in fixed area to prevent overwriting final summary
+    # Only print to stderr for debug purposes
+    if _shutting_down:
+        if debug_mode:
+            import sys
+            timestamp = datetime.now().strftime('[%H:%M:%S]')
+            if thread_id:
+                error_line = f"{timestamp} [{thread_id}] ⚠ {message}"
+            else:
+                error_line = f"{timestamp} ⚠ {message}"
+            print(error_line, file=sys.stderr, flush=True)
+        return
     
     if not _display_initialized:
         _init_display_coordinator()
@@ -383,13 +401,27 @@ def display_error_message(message, thread_id=None):
 
 def stop_status_display():
     """Stop the centralized status display thread and wait for it to finish."""
-    global _status_display_active, _status_display_thread
+    global _status_display_active, _status_display_thread, _error_message_lines
+    global _ansi_supported, _results_area_height, _max_thread_lines, _error_area_height
+    global _display_initialized
     _status_display_active = False
     with _status_lock:
         _thread_status.clear()
     # Wait for display thread to finish (with timeout)
     if _status_display_thread and _status_display_thread.is_alive():
         _status_display_thread.join(timeout=0.5)
+    
+    # Clear error area to prevent it from overwriting final summary
+    if _ansi_supported and _display_initialized:
+        error_start_line = _results_area_height + _max_thread_lines + 1
+        for i in range(_error_area_height):
+            target_line = error_start_line + i
+            print(f'\033[{target_line + 1};1H', end='', flush=True)
+            print('\033[K', end='', flush=True)  # Clear line
+    
+    # Clear error message lines
+    _error_message_lines = []
+    
     # Don't clear screen - we want to preserve the displayed results
     # Just ensure we're ready for normal printing
     if _ansi_supported:
@@ -873,15 +905,23 @@ def debug_print(*args, **kwargs):
     ignored to reduce output verbosity. When enabled, messages are prefixed with
     a timestamp in [HH:MM:SS.mmm] format.
     
+    When debug mode is enabled, messages are printed to stderr to completely avoid
+    interference with the fixed display system (which uses stdout). This ensures
+    debug messages scroll independently and are never overwritten by display updates.
+    Debug messages will appear in the terminal alongside the fixed display.
+    
     Args:
         *args: Variable positional arguments passed to print()
         **kwargs: Variable keyword arguments passed to print()
     """
     if debug_mode:
+        import sys
         # Format timestamp as [HH:MM:SS.mmm]
         timestamp = datetime.now().strftime('[%H:%M:%S.%f')[:-3] + ']'
-        # Combine timestamp with message
-        print(timestamp, *args, **kwargs)
+        
+        # Print to stderr - this completely avoids interference with fixed display on stdout
+        # Debug messages will scroll naturally in stderr, independent of the fixed display
+        print(timestamp, *args, file=sys.stderr, **kwargs, flush=True)
 
 def get_voting_widget_info():
     """
@@ -995,6 +1035,195 @@ def get_voting_widget_info():
         print(f"Error fetching page: {e}")
         return None
 
+def get_random_user_agent():
+    """
+    Generate a random realistic User-Agent string to avoid detection.
+    
+    Returns:
+        str: A random User-Agent string from a pool of realistic browsers
+    """
+    user_agents = [
+        # Chrome on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        # Chrome on macOS
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        # Chrome on macOS (Apple Silicon)
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        # Firefox on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+        # Firefox on macOS
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+        # Safari on macOS
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        # Edge on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    ]
+    return random.choice(user_agents)
+
+def get_random_viewport():
+    """
+    Generate random viewport dimensions to avoid fingerprinting.
+    
+    Returns:
+        tuple: (width, height) viewport dimensions
+    """
+    viewports = [
+        (1920, 1080),  # Full HD
+        (1366, 768),   # Common laptop
+        (1536, 864),   # Common laptop
+        (1440, 900),   # MacBook
+        (1600, 900),   # Common desktop
+        (1280, 720),   # HD
+        (2560, 1440),  # 2K
+    ]
+    return random.choice(viewports)
+
+def inject_anti_detection_scripts(driver):
+    """
+    Inject comprehensive JavaScript to mask automation and make browser appear more human-like.
+    
+    This function adds multiple layers of anti-detection:
+    - Removes webdriver property
+    - Masks automation flags
+    - Adds realistic browser properties (plugins, languages, permissions)
+    - Overrides Chrome automation detection
+    
+    Args:
+        driver: Selenium WebDriver instance
+    """
+    anti_detection_script = """
+    // Remove webdriver property
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+    });
+    
+    // Override Chrome automation detection
+    window.chrome = {
+        runtime: {}
+    };
+    
+    // Add realistic plugins
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+    });
+    
+    // Add realistic languages
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+    });
+    
+    // Override permissions API
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+    );
+    
+    // Mask automation in navigator
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => false
+    });
+    
+    // Add realistic connection properties
+    Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+            effectiveType: '4g',
+            rtt: 50,
+            downlink: 10,
+            saveData: false
+        })
+    });
+    
+    // Override getBattery if it exists
+    if (navigator.getBattery) {
+        navigator.getBattery = undefined;
+    }
+    
+    // Add realistic hardware concurrency
+    Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: () => 8
+    });
+    
+    // Add realistic device memory
+    Object.defineProperty(navigator, 'deviceMemory', {
+        get: () => 8
+    });
+    
+    // Override automation flags
+    Object.defineProperty(navigator, 'automation', {
+        get: () => undefined
+    });
+    
+    // Mask headless Chrome detection
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+        get: () => 0
+    });
+    
+    // Add realistic platform
+    Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32'
+    });
+    
+    // Override toString methods to hide automation
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) {
+            return 'Intel Inc.';
+        }
+        if (parameter === 37446) {
+            return 'Intel Iris OpenGL Engine';
+        }
+        return getParameter.call(this, parameter);
+    };
+    """
+    
+    try:
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': anti_detection_script
+        })
+    except Exception as e:
+        # Fallback to execute_script if CDP not available
+        debug_print(f"CDP command failed, using fallback: {e}")
+        driver.execute_script(anti_detection_script)
+
+def simulate_human_delay(min_seconds=0.1, max_seconds=0.5):
+    """
+    Add a random delay to simulate human reaction time.
+    
+    Args:
+        min_seconds (float): Minimum delay in seconds
+        max_seconds (float): Maximum delay in seconds
+    """
+    if enhanced_anti_detection:
+        delay = random.uniform(min_seconds, max_seconds)
+        time.sleep(delay)
+
+def simulate_mouse_movement(driver, element):
+    """
+    Simulate human-like mouse movement to an element before clicking.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        element: WebElement to move to
+    """
+    if enhanced_anti_detection:
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            actions = ActionChains(driver)
+            # Move to element with a slight offset to simulate human imprecision
+            actions.move_to_element_with_offset(element, random.randint(-5, 5), random.randint(-5, 5))
+            actions.pause(random.uniform(0.1, 0.3))
+            actions.perform()
+            simulate_human_delay(0.1, 0.3)
+        except Exception as e:
+            debug_print(f"Mouse movement simulation failed: {e}")
+
 def find_athlete_option(soup, athlete_name):
     """
     Find the voting option/button element for the specified athlete in the HTML.
@@ -1097,12 +1326,81 @@ def submit_vote_selenium():
     
     # Configure Chrome options for headless operation and anti-detection
     chrome_options = Options()
-    chrome_options.add_argument('--headless')  # Run in background without GUI
+    
+    # Headless mode (can be disabled for better detection evasion)
+    global use_headless
+    if use_headless:
+        # Use new headless mode which is harder to detect (Chrome 109+)
+        # Falls back to old headless automatically if Chrome version doesn't support it
+        chrome_options.add_argument('--headless=new')  # New headless mode (harder to detect)
+    else:
+        # Non-headless mode is less detectable but requires display
+        # Add window size for consistency
+        viewport = get_random_viewport()
+        chrome_options.add_argument(f'--window-size={viewport[0]},{viewport[1]}')
+        # Additional options for non-headless stability
+        chrome_options.add_argument('--disable-gpu')  # Disable GPU acceleration (can cause issues)
+        chrome_options.add_argument('--disable-software-rasterizer')  # Disable software rasterizer
+        chrome_options.add_argument('--disable-background-timer-throttling')  # Prevent background throttling
+        chrome_options.add_argument('--disable-backgrounding-occluded-windows')  # Prevent window backgrounding
+        chrome_options.add_argument('--disable-renderer-backgrounding')  # Prevent renderer backgrounding
+    
     chrome_options.add_argument('--no-sandbox')  # Required for some environments
     chrome_options.add_argument('--disable-dev-shm-usage')  # Prevent shared memory issues
     chrome_options.add_argument('--disable-blink-features=AutomationControlled')  # Hide automation
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])  # Anti-detection
+    # Add timeout and connection stability options
+    chrome_options.add_argument('--disable-extensions')  # Disable extensions for stability
+    chrome_options.add_argument('--disable-plugins')  # Disable plugins for stability
+    chrome_options.add_argument('--disable-default-apps')  # Disable default apps
+    
+    # Enhanced anti-detection measures
+    global enhanced_anti_detection
+    if enhanced_anti_detection:
+        # Randomize viewport size to avoid fingerprinting
+        viewport = get_random_viewport()
+        chrome_options.add_argument(f'--window-size={viewport[0]},{viewport[1]}')
+        
+        # Additional stealth arguments
+        chrome_options.add_argument('--disable-infobars')
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-plugins-discovery')
+        chrome_options.add_argument('--disable-default-apps')
+        chrome_options.add_argument('--disable-features=IsolateOrigins,site-per-process')
+        chrome_options.add_argument('--disable-site-isolation-trials')
+        
+        # Randomize user agent
+        user_agent = get_random_user_agent()
+        chrome_options.add_argument(f'--user-agent={user_agent}')
+    
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])  # Anti-detection
     chrome_options.add_experimental_option('useAutomationExtension', False)  # Disable automation extension
+    
+    # Add preferences to make browser more realistic and block permission dialogs
+    prefs = {
+        "profile.default_content_setting_values": {
+            "notifications": 2,  # Block notifications
+            "geolocation": 2,    # Block geolocation
+            "media_stream": 2,   # Block media stream (prevents camera/mic permission dialogs)
+        },
+        "profile.managed_default_content_settings": {
+            "images": 1  # Allow images
+        },
+        # Block local network access permission prompts
+        "profile.content_settings.exceptions.local_network_access": {
+            "*": {
+                "setting": 2  # Block local network access
+            }
+        }
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    
+    # Additional Chrome options to prevent permission dialogs
+    chrome_options.add_argument('--disable-notifications')  # Disable notifications
+    chrome_options.add_argument('--disable-geolocation')  # Disable geolocation
+    chrome_options.add_argument('--disable-media-stream')  # Disable media stream
+    # Block local network access permission (prevents macOS permission dialog)
+    chrome_options.add_argument('--disable-features=LocalNetworkAccess')
+    chrome_options.add_argument('--deny-permission-prompts')  # Deny all permission prompts automatically
     
     # Initialize driver to None to ensure cleanup in finally block
     driver = None
@@ -1219,22 +1517,56 @@ def submit_vote_selenium():
                             print("   export CHROMEDRIVER_PATH=/path/to/chromedriver")
                         print("="*60 + "\n")
                     raise
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Set implicit wait and page load timeout for better connection stability
+        # Use reasonable timeouts - implicit wait should be short to avoid hanging
+        # We'll use explicit WebDriverWait for specific elements instead
+        if use_headless:
+            driver.implicitly_wait(2)  # Short implicit wait - use explicit waits for specific elements
+            driver.set_page_load_timeout(30)  # 30 second page load timeout
+        else:
+            driver.implicitly_wait(3)  # Short implicit wait even in non-headless - prevents hanging
+            driver.set_page_load_timeout(60)  # Longer timeout for non-headless mode (page load can be slower)
+        
+        # Inject comprehensive anti-detection scripts
+        if enhanced_anti_detection:
+            inject_anti_detection_scripts(driver)
+        else:
+            # Basic webdriver property removal (existing behavior)
+            try:
+                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            except Exception as e:
+                debug_print(f"Warning: Could not execute webdriver property script: {e}")
+                # Continue anyway - this is not critical
         
         # Page load timing
         page_load_start = time.time()
         debug_print("[PERF] Starting page load")
-        driver.get(VOTE_URL)
-        debug_print("[PERF] Page load request sent")
+        try:
+            driver.get(VOTE_URL)
+            debug_print("[PERF] Page load request sent")
+        except TimeoutException as e:
+            debug_print(f"[PERF] Page load timeout: {e}")
+            # Try to continue anyway - page might have partially loaded
+            display_error_message(f"Page load timeout, continuing anyway...")
+        except Exception as e:
+            debug_print(f"[PERF] Page load error: {e}")
+            raise  # Re-raise other exceptions
         
         # Wait for page to fully load and JavaScript to execute
         # Use WebDriverWait instead of fixed sleep for better performance
         debug_print("Waiting for page to load...")
         try:
-            wait = WebDriverWait(driver, 10)
+            # Use longer timeout for non-headless mode
+            wait_timeout = 20 if not use_headless else 10
+            wait = WebDriverWait(driver, wait_timeout)
             # Wait for document ready state
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             debug_print("Page DOM ready")
+        except TimeoutException as e:
+            # Fallback to shorter fixed wait if WebDriverWait fails
+            debug_print(f"[PERF] WebDriverWait timeout, using fallback: {e}")
+            time.sleep(2)
         except Exception as e:
             # Fallback to shorter fixed wait if WebDriverWait fails
             debug_print(f"[PERF] WebDriverWait failed, using fallback: {e}")
@@ -1243,8 +1575,55 @@ def submit_vote_selenium():
         page_load_elapsed = time.time() - page_load_start
         debug_print(f"[PERF] Page load completed in {page_load_elapsed:.2f} seconds")
         
+        # Add delay after page load to let JavaScript fully initialize (helps avoid detection)
+        if enhanced_anti_detection:
+            simulate_human_delay(1.0, 2.0)  # Simulate human reading the page
+        else:
+            time.sleep(0.5)  # Brief delay for JavaScript to initialize
+        
+        # Try to dismiss any browser permission dialogs that might appear
+        # These are system-level dialogs (like local network access) that block interaction
+        debug_print("Checking for browser permission dialogs...")
+        try:
+            # Use JavaScript to check if page is interactive (permission dialogs block interaction)
+            # If we can execute JS, the page is likely interactive
+            test_script = "return document.readyState === 'complete' && document.body !== null;"
+            page_ready = driver.execute_script(test_script)
+            if not page_ready:
+                debug_print("⚠ Page may not be fully ready, waiting...")
+                time.sleep(1)
+            else:
+                debug_print("✓ Page appears ready for interaction")
+            
+            # Try to automatically deny any permission requests via JavaScript
+            # This handles web-based permission prompts (not system dialogs)
+            try:
+                deny_permissions_script = """
+                if (navigator.permissions) {
+                    navigator.permissions.query({name: 'notifications'}).then(result => {
+                        if (result.state === 'prompt') {
+                            // Permission is being requested, but we can't deny it from JS
+                            // Chrome options should handle this
+                        }
+                    }).catch(() => {});
+                }
+                """
+                driver.execute_script(deny_permissions_script)
+            except:
+                pass  # Ignore errors - permissions API might not be available
+                
+        except Exception as e:
+            debug_print(f"⚠ Could not check page readiness: {e}")
+            # If we can't execute JS, there might be a system dialog blocking
+            # In non-headless mode, user may need to manually dismiss it
+            if not use_headless:
+                debug_print("⚠ If you see a permission dialog, please click 'Block' or 'Deny'")
+            # Continue anyway - might still work
+        
         # Wait for React/content to be rendered
-        wait = WebDriverWait(driver, 30)
+        # Use longer timeout for non-headless mode
+        wait_timeout = 45 if not use_headless else 30
+        wait = WebDriverWait(driver, wait_timeout)
         
         # Handle cookie consent modal/overlay that might block clicks
         # OneTrust is a common cookie consent platform used by many websites
@@ -1298,8 +1677,9 @@ def submit_vote_selenium():
                                     click_elapsed = time.time() - click_start
                                     debug_print(f"[PERF] Button click took {click_elapsed:.3f}s")
                                     debug_print("✓ Clicked cookie consent button")
-                                    # Reduced wait time - overlay should disappear quickly
-                                    time.sleep(0.5)
+                                    # Minimal wait - overlay should disappear quickly
+                                    # In non-headless, we'll check if it's gone rather than fixed wait
+                                    time.sleep(0.2)
                                     button_found = True
                                     break
                                 except Exception as click_error:
@@ -1310,8 +1690,8 @@ def submit_vote_selenium():
                                         js_click_elapsed = time.time() - js_click_start
                                         debug_print(f"[PERF] JavaScript click took {js_click_elapsed:.3f}s")
                                         debug_print("✓ Clicked cookie consent button (JavaScript)")
-                                        # Reduced wait time - overlay should disappear quickly
-                                        time.sleep(0.5)
+                                        # Minimal wait - overlay should disappear quickly
+                                        time.sleep(0.2)
                                         button_found = True
                                         break
                                     except Exception as js_error:
@@ -1322,38 +1702,69 @@ def submit_vote_selenium():
                     debug_print(f"[PERF] Selector {selector_idx} failed after {selector_elapsed:.3f}s: {e}")
                     continue
             
-            # Wait for overlay to disappear
+            # Wait for overlay to disappear (optimized - shorter timeout, faster checks)
             overlay_wait_start = time.time()
-            max_overlay_wait = 10
+            max_overlay_wait = 5  # Reduced from 10s - overlay should disappear quickly
             overlay_wait = 0
+            debug_print(f"Waiting for overlay to disappear (max {max_overlay_wait}s)...")
             while overlay_wait < max_overlay_wait:
                 try:
                     check_start = time.time()
-                    overlays = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
-                    visible_overlays = [o for o in overlays if o.is_displayed()]
-                    check_elapsed = time.time() - check_start
-                    if not visible_overlays:
-                        overlay_wait_elapsed = time.time() - overlay_wait_start
-                        debug_print(f"[PERF] Overlay dismissal check took {check_elapsed:.3f}s (total wait: {overlay_wait_elapsed:.2f}s)")
-                        debug_print("✓ Cookie consent overlay dismissed")
+                    # Use a short timeout for the find operation to prevent hanging
+                    try:
+                        # Temporarily reduce implicit wait for this check
+                        driver.implicitly_wait(0.5)  # Very short wait for overlay check
+                        overlays = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
+                        # Restore original implicit wait
+                        driver.implicitly_wait(2 if use_headless else 3)
+                        
+                        visible_overlays = []
+                        for overlay in overlays:
+                            try:
+                                if overlay.is_displayed():
+                                    visible_overlays.append(overlay)
+                            except Exception:
+                                # Element might have been removed from DOM
+                                pass
+                        
+                        check_elapsed = time.time() - check_start
+                        if not visible_overlays:
+                            overlay_wait_elapsed = time.time() - overlay_wait_start
+                            debug_print(f"[PERF] Overlay dismissal check took {check_elapsed:.3f}s (total wait: {overlay_wait_elapsed:.2f}s)")
+                            debug_print("✓ Cookie consent overlay dismissed")
+                            break
+                    except TimeoutException:
+                        debug_print("  ⚠ Overlay check timed out, assuming overlay is gone...")
                         break
-                    time.sleep(0.5)
-                    overlay_wait += 0.5
+                    except Exception as find_error:
+                        debug_print(f"  ⚠ Error finding overlays: {find_error}, assuming gone...")
+                        break
+                    
+                    # Log progress every 1 second (more frequent updates)
+                    if int(overlay_wait) % 1 == 0 and overlay_wait > 0:
+                        debug_print(f"  Still waiting for overlay... ({overlay_wait:.1f}s)")
+                    time.sleep(0.3)  # Reduced from 0.5s - check more frequently
+                    overlay_wait += 0.3
                 except Exception as e:
                     debug_print(f"[PERF] Error checking overlay: {e}")
                     break
+            if overlay_wait >= max_overlay_wait:
+                debug_print(f"⚠ Overlay wait timeout after {overlay_wait:.1f}s, continuing anyway...")
             
             # Reduced wait for animations - check if overlay is gone instead of fixed wait
             animation_wait_start = time.time()
+            debug_print("Checking for animation completion...")
             # Quick check - if overlay is already gone, don't wait
             try:
                 overlays_check = driver.find_elements(By.CSS_SELECTOR, ".onetrust-pc-dark-filter")
                 visible_check = [o for o in overlays_check if o.is_displayed()]
                 if visible_check:
+                    debug_print("  Overlay still visible, waiting 0.5s for animation...")
                     time.sleep(0.5)  # Only wait if overlay still visible
                 else:
                     debug_print("[PERF] Overlay already gone, skipping animation wait")
-            except:
+            except Exception as e:
+                debug_print(f"  Error checking overlay for animation: {e}")
                 time.sleep(0.3)  # Minimal fallback wait
             animation_wait_elapsed = time.time() - animation_wait_start
             debug_print(f"[PERF] Animation wait: {animation_wait_elapsed:.3f}s")
@@ -1381,30 +1792,58 @@ def submit_vote_selenium():
             iframe_search_elapsed = time.time() - iframe_search_start
             debug_print(f"[PERF] Iframe search took {iframe_search_elapsed:.3f} seconds")
             debug_print(f"Found {len(iframes)} iframes on page")
-            for iframe_idx, iframe in enumerate(iframes, 1):
+            
+            # Optimize: Check iframes in batches, skip ad iframes quickly
+            # Limit to first 20 iframes to avoid checking too many (voting widget is usually early)
+            max_iframes_to_check = min(20, len(iframes))
+            for iframe_idx, iframe in enumerate(iframes[:max_iframes_to_check], 1):
                 try:
                     attr_start = time.time()
+                    # Get src first (fastest check) - skip if it's clearly an ad
                     src = iframe.get_attribute('src')
                     iframe_id = iframe.get_attribute('id') or 'no-id'
                     attr_elapsed = time.time() - attr_start
                     all_iframes.append((iframe, src, iframe_id))
+                    
+                    # Quick skip for ad iframes (check src first before other attributes)
+                    if src and any(skip in src.lower() for skip in ['google', 'ads', 'doubleclick', 'adservice', 'imasdk', 'googlesyndication', 'advertising', 'adserver']):
+                        # Don't even log - just skip quickly
+                        continue
+                    
+                    # Check for voting-related keywords in src
                     if src and ('poll' in src.lower() or 'vote' in src.lower() or 'survey' in src.lower() or 'widget' in src.lower()):
                         debug_print(f"[PERF] Iframe {iframe_idx} attribute check took {attr_elapsed:.3f}s")
-                        debug_print(f"Found potential voting iframe: {src}")
+                        debug_print(f"Found potential voting iframe: {src[:100]}...")  # Truncate long URLs
                         switch_start = time.time()
-                        driver.switch_to.frame(iframe)
-                        switch_elapsed = time.time() - switch_start
-                        debug_print(f"[PERF] Frame switch took {switch_elapsed:.3f}s")
-                        in_iframe = True
-                        active_iframe = iframe
-                        time.sleep(2)
-                        # Now search within the iframe
-                        break
-                    else:
-                        debug_print(f"[PERF] Iframe {iframe_idx} check took {attr_elapsed:.3f}s (not a voting iframe)")
+                        try:
+                            driver.switch_to.frame(iframe)
+                            switch_elapsed = time.time() - switch_start
+                            debug_print(f"[PERF] Frame switch took {switch_elapsed:.3f}s")
+                            in_iframe = True
+                            active_iframe = iframe
+                            # Reduced wait - check if content is ready instead of fixed wait
+                            time.sleep(0.5)  # Reduced from 1s
+                            # Now search within the iframe
+                            break
+                        except Exception as switch_error:
+                            debug_print(f"⚠ Error switching to iframe {iframe_idx}: {switch_error}")
+                            # Switch back to default content before trying next
+                            try:
+                                driver.switch_to.default_content()
+                            except:
+                                pass
+                            # Try next iframe
+                            continue
+                    # Only log non-ad iframes that we're skipping (to avoid spam)
+                    # Don't log every iframe to reduce output
                 except Exception as e:
-                    debug_print(f"[PERF] Error checking iframe {iframe_idx}: {e}")
+                    # Only log errors for first few iframes to avoid spam
+                    if iframe_idx <= 5:
+                        debug_print(f"[PERF] Error checking iframe {iframe_idx}: {e}")
                     continue
+            
+            if len(iframes) > max_iframes_to_check:
+                debug_print(f"Skipped checking {len(iframes) - max_iframes_to_check} additional iframes (likely ads)")
             iframe_elapsed = time.time() - iframe_start
             debug_print(f"[PERF] Iframe detection completed in {iframe_elapsed:.2f} seconds")
         except Exception as e:
@@ -1428,9 +1867,12 @@ def submit_vote_selenium():
                 ".pds-radiobutton",  # Radio button container
             ]
             
-            max_widget_wait = 5  # Maximum 5 seconds to wait for widget
+            max_widget_wait = 3  # Reduced from 5s - widget should load quickly
             widget_wait_elapsed = 0
             wait_interval = 0.2
+            
+            # Temporarily reduce implicit wait for faster widget detection
+            driver.implicitly_wait(0.5)  # Short wait for widget elements
             
             while widget_wait_elapsed < max_widget_wait and not widget_ready:
                 for selector in widget_selectors:
@@ -1455,6 +1897,9 @@ def submit_vote_selenium():
                 
                 time.sleep(wait_interval)
                 widget_wait_elapsed += wait_interval
+            
+            # Restore implicit wait
+            driver.implicitly_wait(2 if use_headless else 3)
             
             if not widget_ready:
                 debug_print(f"[PERF] Widget wait timeout after {widget_wait_elapsed:.2f}s, proceeding anyway")
@@ -1488,6 +1933,9 @@ def submit_vote_selenium():
         ]
         
         debug_print("Searching for voting elements...")
+        # Temporarily reduce implicit wait for faster element search
+        driver.implicitly_wait(1)  # Short wait for vote button search
+        
         for strategy_idx, (strategy_type, selector) in enumerate(strategies, 1):
             strategy_start = time.time()
             try:
@@ -1535,8 +1983,8 @@ def submit_vote_selenium():
                                 # Wait for element to be clickable, not just present
                                 # This ensures React/JavaScript has finished making it interactive
                                 try:
-                                    # Use WebDriverWait to ensure element is clickable
-                                    wait_elem = WebDriverWait(driver, 1)
+                                    # Use WebDriverWait with short timeout to ensure element is clickable
+                                    wait_elem = WebDriverWait(driver, 0.5)  # Reduced from 1s
                                     wait_elem.until(EC.element_to_be_clickable(elem))
                                 except:
                                     # If WebDriverWait fails, fall back to basic checks
@@ -1567,6 +2015,9 @@ def submit_vote_selenium():
                 strategy_elapsed = time.time() - strategy_start
                 debug_print(f"[PERF] Strategy {strategy_idx} failed after {strategy_elapsed:.3f}s: {e}")
                 continue
+        
+        # Restore implicit wait after vote button search
+        driver.implicitly_wait(2 if use_headless else 3)
         
         vote_search_elapsed = time.time() - vote_search_start
         debug_print(f"[PERF] Vote button search completed in {vote_search_elapsed:.2f} seconds")
@@ -1601,13 +2052,22 @@ def submit_vote_selenium():
                 element_interaction_start = time.time()
                 debug_print("[PERF] Starting element interaction")
                 
-                # Scroll into view
+                # Scroll into view with human-like behavior
                 scroll_start = time.time()
-                driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", vote_button)
+                if enhanced_anti_detection:
+                    # Use smooth scrolling for more realistic behavior
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", vote_button)
+                    # Wait for smooth scroll to complete
+                    simulate_human_delay(0.3, 0.6)
+                else:
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", vote_button)
+                    time.sleep(0.2)
                 scroll_elapsed = time.time() - scroll_start
                 debug_print(f"[PERF] Scroll into view took {scroll_elapsed:.3f}s")
-                # Reduced wait - scroll should be instant
-                time.sleep(0.2)
+                
+                # Simulate mouse movement before clicking (if enhanced mode)
+                if enhanced_anti_detection:
+                    simulate_mouse_movement(driver, vote_button)
                 
                 # Make sure no overlays are blocking
                 overlay_check_start = time.time()
@@ -1648,10 +2108,17 @@ def submit_vote_selenium():
                     try:
                         radio_click_start = time.time()
                         if not vote_button.is_selected():
+                            # Simulate human-like interaction
+                            if enhanced_anti_detection:
+                                simulate_mouse_movement(driver, vote_button)
+                                simulate_human_delay(0.2, 0.4)
                             vote_button.click()
                             radio_click_elapsed = time.time() - radio_click_start
                             debug_print(f"[PERF] Radio button click took {radio_click_elapsed:.3f}s")
                             debug_print(f"✓ Selected radio button for {TARGET_ATHLETE}")
+                            # Add delay after selection to simulate reading/thinking
+                            if enhanced_anti_detection:
+                                simulate_human_delay(0.5, 1.0)
                         else:
                             debug_print(f"✓ Radio button already selected")
                     except Exception as click_error:
@@ -1670,8 +2137,11 @@ def submit_vote_selenium():
                         else:
                             raise click_error
                     
-                    # Reduced wait - radio selection should register immediately
-                    time.sleep(0.3)
+                    # Wait for radio selection to register (longer in enhanced mode)
+                    if enhanced_anti_detection:
+                        simulate_human_delay(0.5, 1.0)
+                    else:
+                        time.sleep(0.3)
                     radio_selection_elapsed = time.time() - radio_selection_start
                     debug_print(f"[PERF] Radio button selection completed in {radio_selection_elapsed:.3f}s")
                     
@@ -1791,12 +2261,20 @@ def submit_vote_selenium():
                 debug_print(f"  ID: {btn_id}")
                 debug_print(f"  Class: {btn_class[:100]}")
                 
+                # Simulate human-like behavior before clicking
+                if enhanced_anti_detection:
+                    simulate_mouse_movement(driver, vote_button)
+                    simulate_human_delay(0.3, 0.6)  # Simulate reading the button
+                
                 # Try to click - if intercepted, use JavaScript click
                 try:
                     vote_button.click()
                     vote_click_elapsed = time.time() - vote_click_start
                     debug_print(f"[PERF] Vote button click took {vote_click_elapsed:.3f}s")
                     debug_print(f"✓ Successfully clicked vote button (regular click)")
+                    # Add delay after click to simulate human reaction
+                    if enhanced_anti_detection:
+                        simulate_human_delay(0.2, 0.4)
                 except Exception as click_error:
                     if "click intercepted" in str(click_error).lower():
                         debug_print("⚠ Click intercepted, trying JavaScript click instead...")
@@ -2141,11 +2619,26 @@ def submit_vote_selenium():
         # This ensures Chrome/ChromeDriver processes are terminated even on exceptions
         if driver is not None:
             try:
-                driver.quit()
-                debug_print("[CLEANUP] WebDriver cleaned up successfully")
+                # Check if driver is still connected before trying to quit
+                try:
+                    # Try a simple operation to check if connection is alive
+                    _ = driver.current_url
+                except Exception:
+                    # Connection is dead, skip quit() to avoid hanging
+                    debug_print("[CLEANUP] WebDriver connection already closed, skipping quit()")
+                else:
+                    # Connection is alive, proceed with quit()
+                    driver.quit()
+                    debug_print("[CLEANUP] WebDriver cleaned up successfully")
+            except TimeoutException:
+                debug_print("[CLEANUP] WebDriver.quit() timed out (connection may be dead)")
             except Exception as cleanup_error:
-                # If quit() fails, try to kill the process directly
-                debug_print(f"[CLEANUP] WebDriver.quit() failed: {cleanup_error}")
+                # If quit() fails, log but don't hang
+                error_msg = str(cleanup_error)
+                if "Connection aborted" in error_msg or "Remote end closed" in error_msg:
+                    debug_print("[CLEANUP] WebDriver connection already closed (expected in some error cases)")
+                else:
+                    debug_print(f"[CLEANUP] WebDriver.quit() failed: {cleanup_error}")
                 try:
                     # Attempt to kill Chrome processes as fallback
                     import gc
@@ -2157,7 +2650,8 @@ def submit_vote_selenium():
         if service is not None:
             try:
                 service.stop()
-            except:
+            except Exception as e:
+                debug_print(f"[CLEANUP] Service.stop() failed: {e}")
                 pass
         
         # Force garbage collection to help release Selenium objects
@@ -2412,8 +2906,29 @@ def print_top_results(results, top_n=5, total_votes=None):
         total_votes_formatted = f"{total_votes:,}"
         result_lines.append(f"Total Votes: {total_votes_formatted}")
     
-    # Add separator before verification info
+    # Add separator before runtime and verification info
     result_lines.append("")  # Blank line
+    result_lines.append("=" * 60)
+    
+    # Add total runtime (only updated by main thread)
+    global _session_start_time
+    if _session_start_time is not None:
+        elapsed_seconds = time.time() - _session_start_time
+        hours = int(elapsed_seconds // 3600)
+        minutes = int((elapsed_seconds % 3600) // 60)
+        seconds = int(elapsed_seconds % 60)
+        
+        if hours > 0:
+            runtime_str = f"Total Run Time: {hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            runtime_str = f"Total Run Time: {minutes}m {seconds}s"
+        else:
+            runtime_str = f"Total Run Time: {seconds}s"
+        
+        result_lines.append(runtime_str)
+        result_lines.append("")  # Blank line
+    
+    # Add separator before verification info
     result_lines.append("=" * 60)
     
     # Add verification info if available
@@ -2962,6 +3477,13 @@ def main():
                             'Cutler\'s position or behind count. Useful for maximum voting speed.')
     parser.add_argument('--check-system', action='store_true', default=False,
                        help='Display system CPU information and thread count recommendations, then exit.')
+    parser.add_argument('--enhanced-anti-detection', action='store_true', default=False,
+                       help='Enable enhanced anti-detection measures (slower but more realistic). '
+                            'Includes: realistic delays, mouse movements, viewport randomization, '
+                            'comprehensive JavaScript masking. Recommended if votes are being rejected.')
+    parser.add_argument('--no-headless', action='store_true', default=False,
+                       help='Run browser in visible mode (non-headless). Less detectable but requires display. '
+                            'Useful for debugging or when headless mode is being detected.')
     args = parser.parse_args()
     
     # Handle --check-system option
@@ -3031,6 +3553,16 @@ def main():
     start_thread_count = args.start_threads
     max_threads = args.max_threads
     lead_threshold = args.lead_threshold
+    
+    # Set anti-detection flags
+    global enhanced_anti_detection, use_headless
+    enhanced_anti_detection = args.enhanced_anti_detection
+    use_headless = not args.no_headless
+    
+    if enhanced_anti_detection:
+        print("ℹ Enhanced anti-detection mode: ENABLED (slower but more realistic)")
+    if not use_headless:
+        print("ℹ Headless mode: DISABLED (browser will be visible)")
     
     # Validate thread counts
     if max_threads < 1:
@@ -3164,10 +3696,11 @@ def main():
     # Initialize session ID for JSON logging (unique per application run)
     # This prevents duplicate vote numbers from being confusing across restarts
     # Each restart gets a new session_id, but vote_number resets to 1 for each session
-    global _current_session_id, _first_vote_completed, _last_verification_vote_count
+    global _current_session_id, _first_vote_completed, _last_verification_vote_count, _session_start_time
     if _current_session_id is None:
         session_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
         _current_session_id = f"{session_start_time}_{uuid.uuid4().hex[:8]}"
+        _session_start_time = time.time()  # Track start time for runtime calculation
         debug_print(f"Session ID: {_current_session_id}")
     
     # Reset vote verification tracking for new session
@@ -3330,7 +3863,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        # Stop status display FIRST to prevent interference with final output
+        # Set shutting down flag FIRST to suppress error messages during cleanup
+        global _shutting_down
+        _shutting_down = True
+        
+        # Stop status display to prevent interference with final output
         stop_status_display()
         
         # Small delay to ensure display thread has fully stopped
@@ -3362,7 +3899,20 @@ def main():
             final_accelerated_count = accelerated_vote_count
             final_super_accelerated_count = super_accelerated_vote_count
         
-        # Now print final summary - display is stopped, so normal printing is safe
+        # Clear any remaining error messages and ensure cursor is in safe position
+        global _display_initialized
+        if _ansi_supported and _display_initialized:
+            total_reserved = _results_area_height + _max_thread_lines + _error_area_height
+            # Clear error area one more time (in case any messages appeared during thread cleanup)
+            error_start_line = _results_area_height + _max_thread_lines + 1
+            for i in range(_error_area_height):
+                target_line = error_start_line + i
+                print(f'\033[{target_line + 1};1H', end='', flush=True)
+                print('\033[K', end='', flush=True)  # Clear line
+            # Move cursor to safe position below all reserved areas
+            print(f'\033[{total_reserved + 2};1H', end='', flush=True)
+        
+        # Now print final summary - display is stopped and error area is cleared
         print(f"\n{'='*60}")
         print(f"Voting session ended")
         print(f"{'='*60}")
